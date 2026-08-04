@@ -13,27 +13,26 @@ BIN_FILE="$BUILD_DIR/rebotarm_executor.bin"
 ELF_FILE="$BUILD_DIR/rebotarm_executor.elf"
 
 USE_OPENOCD=false
-DO_BUILD=false
 
 for arg in "$@"; do
     case $arg in
         --openocd) USE_OPENOCD=true ;;
-        --build)   DO_BUILD=true ;;
         --help|-h)
-            echo "用法: $0 [--build] [--openocd]"
-            echo "  --build    刷写前先编译"
+            echo "用法: $0 [--openocd]"
             echo "  --openocd  使用 OpenOCD 代替 st-flash"
             exit 0
             ;;
     esac
 done
 
-# 编译
-if [ "$DO_BUILD" = true ]; then
-    echo ">>> 编译项目..."
-    cmake --build "$BUILD_DIR"
-    echo ""
-fi
+# 清理并重新编译
+echo ">>> 清理历史构建产物..."
+rm -rf "$BUILD_DIR"
+echo ">>> 配置 CMake..."
+cmake --preset Debug
+echo ">>> 编译项目..."
+cmake --build "$BUILD_DIR"
+echo ""
 
 # 检查固件文件，如果 .bin 不存在则从 .elf 生成
 if [ ! -f "$BIN_FILE" ]; then

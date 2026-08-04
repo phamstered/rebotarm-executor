@@ -5,6 +5,13 @@
 extern FDCAN_HandleTypeDef hfdcan1;
 extern FDCAN_HandleTypeDef hfdcan2;
 
+/* FDCAN1 接收数据缓存 + 任务通知句柄 */
+static uint8_t fdcan1_rx_data[8] = {0};
+static uint16_t fdcan1_rx_id = 0;
+static uint8_t fdcan1_rx_len = 0;
+static volatile uint8_t fdcan1_rx_flag = 0;
+static TaskHandle_t fdcan1_rx_task_handle = NULL;
+
 /* FDCAN2 接收数据缓存 + 任务通知句柄 */
 static uint8_t fdcan2_rx_data[8] = {0};
 static uint16_t fdcan2_rx_id = 0;
@@ -100,6 +107,42 @@ uint8_t fdcanx_receive(FDCAN_HandleTypeDef *hfdcan, uint16_t *rec_id, uint8_t *b
 
 /**
 ************************************************************************
+* @brief:      	fdcan1_register_rx_task(TaskHandle_t handle)
+* @param:       handle: 需要在FDCAN1接收时通知的FreeRTOS任务句柄
+* @retval:     	void
+* @details:    	注册任务句柄，FDCAN1收到数据时通过TaskNotify通知该任务
+************************************************************************
+**/
+void fdcan1_register_rx_task(TaskHandle_t handle)
+{
+	fdcan1_rx_task_handle = handle;
+}
+
+/**
+************************************************************************
+* @brief:      	fdcan1_get_rx_data(uint16_t *id, uint8_t *buf)
+* @param:       id: 接收到的CAN ID
+* @param:       buf: 接收数据缓存（至少8字节）
+* @retval:     	接收到的数据长度，0表示无新数据
+* @details:    	获取FDCAN1最新接收数据（从RX回调中读取）
+************************************************************************
+**/
+uint8_t fdcan1_get_rx_data(uint16_t *id, uint8_t *buf)
+{
+	if(!fdcan1_rx_flag)
+		return 0;
+
+	*id = fdcan1_rx_id;
+	uint8_t len = fdcan1_rx_len;
+	for(uint8_t i = 0; i < len; i++)
+		buf[i] = fdcan1_rx_data[i];
+
+	fdcan1_rx_flag = 0;
+	return len;
+}
+
+/**
+************************************************************************
 * @brief:      	fdcan2_register_rx_task(TaskHandle_t handle)
 * @param:       handle: 需要在FDCAN2接收时通知的FreeRTOS任务句柄
 * @retval:     	void
@@ -140,7 +183,18 @@ static uint16_t rec_id1;
 
 static void fdcan1_rx_callback(void)
 {
-	fdcanx_receive(&hfdcan1, &rec_id1, rx_data1);
+	fdcan1_rx_len = fdcanx_receive(&hfdcan1, &fdcan1_rx_id, fdcan1_rx_data);
+	if(fdcan1_rx_len > 0)
+	{
+		fdcan1_rx_flag = 1;
+		/* 通知注册的接收任务 */
+		BaseType_t xHigherPriorityTaskWoken = pdFALSE;
+		if(fdcan1_rx_task_handle != NULL)
+		{
+			vTaskNotifyGiveFromISR(fdcan1_rx_task_handle, &xHigherPriorityTaskWoken);
+			portYIELD_FROM_ISR(xHigherPriorityTaskWoken);
+		}
+	}
 }
 
 static void fdcan2_rx_callback(void)

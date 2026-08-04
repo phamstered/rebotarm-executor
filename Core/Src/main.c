@@ -72,6 +72,7 @@ void StartDefaultTask(void *argument);
 // void StartVofaTask(void *argument);
 void StartCanDemoTask(void *argument);
 void StartCan2RxTask(void *argument);
+void StartDamiaoMotorTask(void *argument);
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
@@ -149,14 +150,19 @@ int main(void)
   //   .stack_size = 256 * 4,
   //   .priority = osPriorityNormal,
   // });
-  osThreadNew(StartCanDemoTask, NULL, &(const osThreadAttr_t){
-    .name = "canDemoTask",
-    .stack_size = 256 * 4,
-    .priority = osPriorityNormal,
-  });
-  osThreadNew(StartCan2RxTask, NULL, &(const osThreadAttr_t){
-    .name = "can2RxTask",
-    .stack_size = 256 * 4,
+  // osThreadNew(StartCanDemoTask, NULL, &(const osThreadAttr_t){
+  //   .name = "canDemoTask",
+  //   .stack_size = 256 * 4,
+  //   .priority = osPriorityNormal,
+  // });
+  // osThreadNew(StartCan2RxTask, NULL, &(const osThreadAttr_t){
+  //   .name = "can2RxTask",
+  //   .stack_size = 256 * 4,
+  //   .priority = osPriorityNormal,
+  // });
+  osThreadNew(StartDamiaoMotorTask, NULL, &(const osThreadAttr_t){
+    .name = "damiaoMotorTask",
+    .stack_size = 512 * 4,
     .priority = osPriorityNormal,
   });
   /* USER CODE END RTOS_THREADS */
