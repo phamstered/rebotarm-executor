@@ -2,11 +2,14 @@ cmake_minimum_required(VERSION 3.22)
 # Enable CMake support for ASM and C languages
 enable_language(C ASM)
 # STM32CubeMX generated symbols (macros)
-set(MX_Defines_Syms 
-	USE_PWR_LDO_SUPPLY 
-	USE_HAL_DRIVER 
+set(MX_Defines_Syms
+	USE_PWR_LDO_SUPPLY
+	USE_HAL_DRIVER
 	STM32H723xx
     $<$<CONFIG:Debug>:DEBUG>
+    # micro-ROS transport configuration
+    RMW_UXRCE_TRANSPORT=RMW_UXRCE_TRANSPORT_CUSTOM
+    USE_CUSTOM_TRANSPORT
 )
 
 # STM32CubeMX generated include paths
@@ -26,6 +29,9 @@ set(MX_Include_Dirs
     ${CMAKE_CURRENT_SOURCE_DIR}/../../Middlewares/ST/STM32_USB_Device_Library/Class/CDC/Inc
     ${CMAKE_CURRENT_SOURCE_DIR}/../../vofa+
     ${CMAKE_CURRENT_SOURCE_DIR}/../../User
+    # micro-ROS include paths
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../micro_ros_stm32cubemx_utils/extra_sources
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../micro_ros_stm32cubemx_utils/microros_static_library/libmicroros/microros_include
 )
 
 # STM32CubeMX generated application sources
@@ -37,8 +43,9 @@ set(MX_Application_Src
     ${CMAKE_CURRENT_SOURCE_DIR}/../../Core/Src/stm32h7xx_hal_timebase_tim.c
     ${CMAKE_CURRENT_SOURCE_DIR}/../../Core/Src/sysmem.c
     ${CMAKE_CURRENT_SOURCE_DIR}/../../Core/Src/syscalls.c
-    ${CMAKE_CURRENT_SOURCE_DIR}/../../User/bsp_fdcan.c
-    ${CMAKE_CURRENT_SOURCE_DIR}/../../User/damiao_protocol.c
+    # 电机控制代码已注释
+    # ${CMAKE_CURRENT_SOURCE_DIR}/../../User/bsp_fdcan.c
+    # ${CMAKE_CURRENT_SOURCE_DIR}/../../User/damiao_protocol.c
     ${CMAKE_CURRENT_SOURCE_DIR}/../../startup_stm32h723xx.s
 )
 
@@ -107,9 +114,17 @@ set(USB_Device_Lib_Src
     ${CMAKE_CURRENT_SOURCE_DIR}/../../Middlewares/ST/STM32_USB_Device_Library/Class/CDC/Src/usbd_cdc.c
 )
 
-# vofa+ sources
-set(VOFA_Src
-    ${CMAKE_CURRENT_SOURCE_DIR}/../../vofa+/vofa.c
+# vofa+ sources (已禁用，USB CDC 供 micro-ROS 使用)
+# set(VOFA_Src
+#     ${CMAKE_CURRENT_SOURCE_DIR}/../../vofa+/vofa.c
+# )
+
+# micro-ROS sources
+set(MICROROS_Src
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../micro_ros_stm32cubemx_utils/extra_sources/microros_transports/usb_cdc_transport.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../micro_ros_stm32cubemx_utils/extra_sources/microros_allocators.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../micro_ros_stm32cubemx_utils/extra_sources/microros_time.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../micro_ros_stm32cubemx_utils/extra_sources/custom_memory_manager.c
 )
 
 # Link directories setup
@@ -123,7 +138,9 @@ set(MX_LINK_LIBS
     FreeRTOS
     USB_Device_Lib
     USB_Device_App
-    VOFA	
+    # VOFA  # 已禁用，USB CDC 供 micro-ROS 使用
+    MICROROS
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../micro_ros_stm32cubemx_utils/microros_static_library/libmicroros/libmicroros.a
 )
 # Interface library for includes and symbols
 add_library(stm32cubemx INTERFACE)
@@ -151,10 +168,15 @@ add_library(USB_Device_App OBJECT)
 target_sources(USB_Device_App PRIVATE ${USB_DEVICE_App_Src} ${USB_DEVICE_Target_Src})
 target_link_libraries(USB_Device_App PUBLIC stm32cubemx)
 
-# Create VOFA library
-add_library(VOFA OBJECT)
-target_sources(VOFA PRIVATE ${VOFA_Src})
-target_link_libraries(VOFA PUBLIC stm32cubemx)
+# Create VOFA library (已禁用，USB CDC 供 micro-ROS 使用)
+# add_library(VOFA OBJECT)
+# target_sources(VOFA PRIVATE ${VOFA_Src})
+# target_link_libraries(VOFA PUBLIC stm32cubemx)
+
+# Create MICROROS library
+add_library(MICROROS OBJECT)
+target_sources(MICROROS PRIVATE ${MICROROS_Src})
+target_link_libraries(MICROROS PUBLIC stm32cubemx)
 
 # Add STM32CubeMX generated application sources to the project
 target_sources(${CMAKE_PROJECT_NAME} PRIVATE ${MX_Application_Src})

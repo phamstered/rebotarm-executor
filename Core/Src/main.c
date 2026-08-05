@@ -70,9 +70,10 @@ void StartDefaultTask(void *argument);
 
 /* USER CODE BEGIN PFP */
 // void StartVofaTask(void *argument);
-void StartCanDemoTask(void *argument);
-void StartCan2RxTask(void *argument);
-void StartDamiaoMotorTask(void *argument);
+// void StartCanDemoTask(void *argument);
+// void StartCan2RxTask(void *argument);
+// void StartDamiaoMotorTask(void *argument);  // 电机控制已注释
+void StartMicrorosTask(void *argument);
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
@@ -112,12 +113,12 @@ int main(void)
 
   /* Initialize all configured peripherals */
   MX_GPIO_Init();
-  MX_FDCAN1_Init();
-  MX_FDCAN2_Init();
+  // MX_FDCAN1_Init();  // 电机控制已注释
+  // MX_FDCAN2_Init();  // 电机控制已注释
   /* USER CODE BEGIN 2 */
 
   MX_USB_DEVICE_Init();
-  bsp_can_filter_start();
+  // bsp_can_filter_start();  // 电机控制已注释，CAN 过滤器不需要
 
   /* USER CODE END 2 */
 
@@ -160,9 +161,14 @@ int main(void)
   //   .stack_size = 256 * 4,
   //   .priority = osPriorityNormal,
   // });
-  osThreadNew(StartDamiaoMotorTask, NULL, &(const osThreadAttr_t){
-    .name = "damiaoMotorTask",
-    .stack_size = 512 * 4,
+  // osThreadNew(StartDamiaoMotorTask, NULL, &(const osThreadAttr_t){  // 电机控制已注释
+  //   .name = "damiaoMotorTask",
+  //   .stack_size = 512 * 4,
+  //   .priority = osPriorityNormal,
+  // });
+  osThreadNew(StartMicrorosTask, NULL, &(const osThreadAttr_t){
+    .name = "microrosTask",
+    .stack_size = 3000 * 4,  // micro-ROS 需要较大栈空间
     .priority = osPriorityNormal,
   });
   /* USER CODE END RTOS_THREADS */

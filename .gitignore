@@ -22,3 +22,6 @@ build/
 
 # CubeMX backup
 *.bak
+
+# micro-ROS utils (separate repo)
+micro_ros_stm32cubemx_utils/
