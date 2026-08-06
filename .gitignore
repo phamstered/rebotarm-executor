@@ -23,5 +23,18 @@ build/
 # CubeMX backup
 *.bak
 
-# micro-ROS utils (separate repo)
-micro_ros_stm32cubemx_utils/
+# micro-ROS utils (separate repo). Keep the project-specific USB transport.
+micro_ros_stm32cubemx_utils/*
+!micro_ros_stm32cubemx_utils/extra_sources/
+micro_ros_stm32cubemx_utils/extra_sources/*
+!micro_ros_stm32cubemx_utils/extra_sources/microros_transports/
+micro_ros_stm32cubemx_utils/extra_sources/microros_transports/*
+!micro_ros_stm32cubemx_utils/extra_sources/microros_transports/usb_cdc_transport.c
+!micro_ros_stm32cubemx_utils/microros_static_library/
+micro_ros_stm32cubemx_utils/microros_static_library/*
+!micro_ros_stm32cubemx_utils/microros_static_library/library_generation/
+micro_ros_stm32cubemx_utils/microros_static_library/library_generation/*
+!micro_ros_stm32cubemx_utils/microros_static_library/library_generation/extra_packages/
+micro_ros_stm32cubemx_utils/microros_static_library/library_generation/extra_packages/*
+!micro_ros_stm32cubemx_utils/microros_static_library/library_generation/extra_packages/microros_stm32h723_bridge/
+!micro_ros_stm32cubemx_utils/microros_static_library/library_generation/extra_packages/microros_stm32h723_bridge/**

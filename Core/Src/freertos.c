@@ -28,6 +28,7 @@
 #include "cmsis_os2.h"
 #include "bsp_fdcan.h"
 #include "damiao_protocol.h"
+#include "motor_bridge.h"
 
 // micro-ROS includes
 #include <stdbool.h>
@@ -41,6 +42,11 @@
 #include <rmw_microxrcedds_c/config.h>
 #include <rmw_microros/rmw_microros.h>
 #include <std_msgs/msg/int32.h>
+#include <sensor_msgs/msg/joint_state.h>
+#include <microros_stm32h723_bridge/msg/joint_command.h>
+#include <microros_stm32h723_bridge/msg/hardware_status.h>
+#include <rosidl_runtime_c/string_functions.h>
+#include <rosidl_runtime_c/primitives_sequence_functions.h>
 
 // 电机控制代码已注释，仅保留 micro-ROS 功能
 // #include "bsp_fdcan.h"
@@ -84,6 +90,27 @@ extern void * microros_zero_allocate(size_t number_of_elements, size_t size_of_e
 
 /* Private application code --------------------------------------------------*/
 /* USER CODE BEGIN Application */
+
+void StartMotorControlTask(void *argument)
+{
+  (void)argument;
+  TickType_t wake = xTaskGetTickCount();
+  motor_bridge_init();
+  for (;;) {
+    motor_bridge_control_step(HAL_GetTick());
+    vTaskDelayUntil(&wake, pdMS_TO_TICKS(2U));
+  }
+}
+
+void StartSafetyTask(void *argument)
+{
+  (void)argument;
+  TickType_t wake = xTaskGetTickCount();
+  for (;;) {
+    motor_bridge_safety_step(HAL_GetTick());
+    vTaskDelayUntil(&wake, pdMS_TO_TICKS(10U));
+  }
+}
 
 /**
   * @brief  vofa demo task - 已禁用，USB CDC 供 micro-ROS 使用
@@ -342,12 +369,82 @@ extern FDCAN_HandleTypeDef hfdcan1;
 //   damiao_motor_disable(&motor_state, damiao_can_send, NULL);
 // }
 
-/**
-  * @brief  micro-ROS 任务 - 通过 USB CDC 与 PC 端 agent 通信
-  *         创建节点和发布者，周期性发布 Int32 消息
-  */
+static rcl_publisher_t joint_state_publisher;
+static rcl_publisher_t status_publisher;
+static sensor_msgs__msg__JointState joint_state_message;
+static microros_stm32h723_bridge__msg__HardwareStatus status_message;
+static microros_stm32h723_bridge__msg__JointCommand command_message;
+
+static void joint_command_callback(const void *message)
+{
+  const microros_stm32h723_bridge__msg__JointCommand *ros_command = message;
+  MotorBridgeCommand command = {0};
+  command.sequence = ros_command->sequence;
+  command.mode = ros_command->mode;
+  for (uint32_t i = 0U; i < MOTOR_BRIDGE_JOINT_COUNT; i++) {
+    command.position[i] = ros_command->position[i];
+    command.velocity[i] = ros_command->velocity[i];
+    command.kp[i] = ros_command->kp[i];
+    command.kd[i] = ros_command->kd[i];
+    command.effort[i] = ros_command->effort[i];
+  }
+  (void)motor_bridge_accept_command(&command, HAL_GetTick());
+}
+
+static void publish_timer_callback(rcl_timer_t *timer, int64_t last_call_time)
+{
+  (void)last_call_time;
+  if (timer == NULL) {
+    return;
+  }
+
+  MotorBridgeSnapshot snapshot;
+  motor_bridge_get_snapshot(&snapshot);
+  joint_state_message.position.data[0] = snapshot.position;
+  joint_state_message.velocity.data[0] = snapshot.velocity;
+  joint_state_message.effort.data[0] = snapshot.effort;
+  status_message.last_command_sequence = snapshot.last_command_sequence;
+  status_message.mode = snapshot.mode;
+  status_message.active_joint_mask = snapshot.active_joint_mask;
+  status_message.fault_code = snapshot.fault_code;
+
+  int64_t epoch_ms = rmw_uros_epoch_millis();
+  if (epoch_ms > 0) {
+    int32_t sec = (int32_t)(epoch_ms / 1000LL);
+    uint32_t nanosec = (uint32_t)((epoch_ms % 1000LL) * 1000000LL);
+    joint_state_message.header.stamp.sec = sec;
+    joint_state_message.header.stamp.nanosec = nanosec;
+    status_message.header.stamp.sec = sec;
+    status_message.header.stamp.nanosec = nanosec;
+  }
+
+  if (rcl_publish(&joint_state_publisher, &joint_state_message, NULL) != RCL_RET_OK ||
+      rcl_publish(&status_publisher, &status_message, NULL) != RCL_RET_OK) {
+    motor_bridge_force_disable(MOTOR_FAULT_NONE);
+  }
+}
+
+static bool init_ros_messages(void)
+{
+  if (!sensor_msgs__msg__JointState__init(&joint_state_message) ||
+      !microros_stm32h723_bridge__msg__HardwareStatus__init(&status_message) ||
+      !microros_stm32h723_bridge__msg__JointCommand__init(&command_message)) {
+    return false;
+  }
+  if (!rosidl_runtime_c__String__Sequence__init(&joint_state_message.name, 1U) ||
+      !rosidl_runtime_c__float64__Sequence__init(&joint_state_message.position, 1U) ||
+      !rosidl_runtime_c__float64__Sequence__init(&joint_state_message.velocity, 1U) ||
+      !rosidl_runtime_c__float64__Sequence__init(&joint_state_message.effort, 1U)) {
+    return false;
+  }
+  return rosidl_runtime_c__String__assign(&joint_state_message.name.data[0], "joint1") &&
+         rosidl_runtime_c__String__assign(&joint_state_message.header.frame_id, "base_link") &&
+         rosidl_runtime_c__String__assign(&status_message.header.frame_id, "base_link");
+}
+
 void StartMicrorosTask(void *argument)
 {
+  (void)argument;
   // micro-ROS 配置 - 使用 USB CDC 传输层
   rmw_uros_set_custom_transport(
     true,
@@ -368,29 +465,99 @@ void StartMicrorosTask(void *argument)
     for(;;) { osDelay(1000); }
   }
 
-  // micro-ROS 应用
-  rclc_support_t support;
+  if (!init_ros_messages()) {
+    motor_bridge_force_disable(MOTOR_FAULT_NONE);
+    for (;;) { osDelay(1000U); }
+  }
+
   rcl_allocator_t allocator = rcl_get_default_allocator();
-  rclc_support_init(&support, 0, NULL, &allocator);
+  uint32_t reconnect_delay_ms = 250U;
+  for (;;) {
+    if (rmw_uros_ping_agent(100, 3) != RMW_RET_OK) {
+      motor_bridge_force_disable(MOTOR_FAULT_NONE);
+      osDelay(reconnect_delay_ms);
+      if (reconnect_delay_ms < 2000U) reconnect_delay_ms *= 2U;
+      continue;
+    }
 
-  rcl_node_t node;
-  rclc_node_init_default(&node, "rebotarm_executor", "", &support);
+    rclc_support_t support = {0};
+    rcl_node_t node = rcl_get_zero_initialized_node();
+    rcl_subscription_t subscription = rcl_get_zero_initialized_subscription();
+    rcl_timer_t timer = rcl_get_zero_initialized_timer();
+    rclc_executor_t executor = rclc_executor_get_zero_initialized_executor();
+    joint_state_publisher = rcl_get_zero_initialized_publisher();
+    status_publisher = rcl_get_zero_initialized_publisher();
+    bool initialized = false;
+    bool support_ready = false;
+    bool node_ready = false;
+    bool subscription_ready = false;
+    bool joint_publisher_ready = false;
+    bool status_publisher_ready = false;
+    bool timer_ready = false;
+    bool executor_ready = false;
 
-  rcl_publisher_t publisher;
-  rclc_publisher_init_default(
-    &publisher,
-    &node,
-    ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, Int32),
-    "rebotarm/test");
+    support_ready = rclc_support_init(&support, 0, NULL, &allocator) == RCL_RET_OK;
+    if (support_ready) {
+      node_ready = rclc_node_init_default(
+        &node, "stm32h723_motor_bridge", "", &support) == RCL_RET_OK;
+    }
+    if (node_ready) {
+      subscription_ready = rclc_subscription_init_best_effort(
+          &subscription, &node,
+          ROSIDL_GET_MSG_TYPE_SUPPORT(microros_stm32h723_bridge, msg, JointCommand),
+          "/stm32/joint_commands") == RCL_RET_OK;
+      joint_publisher_ready = rclc_publisher_init_best_effort(
+          &joint_state_publisher, &node,
+          ROSIDL_GET_MSG_TYPE_SUPPORT(sensor_msgs, msg, JointState),
+          "/stm32/joint_states") == RCL_RET_OK;
+      status_publisher_ready = rclc_publisher_init_best_effort(
+          &status_publisher, &node,
+          ROSIDL_GET_MSG_TYPE_SUPPORT(microros_stm32h723_bridge, msg, HardwareStatus),
+          "/stm32/status") == RCL_RET_OK;
+      timer_ready = rclc_timer_init_default(
+        &timer, &support, RCL_MS_TO_NS(20U), publish_timer_callback) == RCL_RET_OK;
+    }
+    if (subscription_ready && joint_publisher_ready && status_publisher_ready && timer_ready) {
+      executor_ready = rclc_executor_init(
+        &executor, &support.context, 2U, &allocator) == RCL_RET_OK;
+    }
+    if (executor_ready &&
+        rclc_executor_add_subscription(&executor, &subscription, &command_message,
+                                       joint_command_callback, ON_NEW_DATA) == RCL_RET_OK &&
+        rclc_executor_add_timer(&executor, &timer) == RCL_RET_OK) {
+      initialized = true;
+      reconnect_delay_ms = 250U;
+      (void)rmw_uros_sync_session(1000);
+    }
 
-  std_msgs__msg__Int32 msg;
-  msg.data = 0;
+    uint32_t last_ping_ms = HAL_GetTick();
+    while (initialized) {
+      if (rclc_executor_spin_some(&executor, RCL_MS_TO_NS(10U)) != RCL_RET_OK) break;
+      if ((uint32_t)(HAL_GetTick() - last_ping_ms) >= 1000U) {
+        last_ping_ms = HAL_GetTick();
+        if (rmw_uros_ping_agent(100, 1) != RMW_RET_OK) break;
+      }
+      osDelay(1U);
+    }
 
-  for(;;)
-  {
-    rcl_publish(&publisher, &msg, NULL);
-    msg.data++;
-    osDelay(100);
+    motor_bridge_force_disable(MOTOR_FAULT_NONE);
+    rcl_ret_t fini_result = RCL_RET_OK;
+    if (support_ready) {
+      rmw_context_t *rmw_context = rcl_context_get_rmw_context(&support.context);
+      if (rmw_context != NULL) {
+        rmw_uros_set_context_entity_destroy_session_timeout(rmw_context, 0U);
+      }
+    }
+    if (executor_ready) fini_result = rclc_executor_fini(&executor);
+    if (timer_ready) fini_result = rcl_timer_fini(&timer);
+    if (subscription_ready) fini_result = rcl_subscription_fini(&subscription, &node);
+    if (status_publisher_ready) fini_result = rcl_publisher_fini(&status_publisher, &node);
+    if (joint_publisher_ready) fini_result = rcl_publisher_fini(&joint_state_publisher, &node);
+    if (node_ready) fini_result = rcl_node_fini(&node);
+    if (support_ready) fini_result = rclc_support_fini(&support);
+    (void)fini_result;
+    osDelay(reconnect_delay_ms);
+    if (reconnect_delay_ms < 2000U) reconnect_delay_ms *= 2U;
   }
 }
 

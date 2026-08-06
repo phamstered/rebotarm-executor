@@ -1,0 +1,4 @@
+interface:
+  display_name: "STM32 micro-ROS Bring-up"
+  short_description: "Build, flash, and verify STM32 micro-ROS firmware"
+  default_prompt: "Use $stm32-microros-bringup to build, flash, and verify this firmware through the Jetson micro-ROS agent."

@@ -5,19 +5,66 @@
 extern FDCAN_HandleTypeDef hfdcan1;
 extern FDCAN_HandleTypeDef hfdcan2;
 
-/* FDCAN1 接收数据缓存 + 任务通知句柄 */
-static uint8_t fdcan1_rx_data[8] = {0};
-static uint16_t fdcan1_rx_id = 0;
-static uint8_t fdcan1_rx_len = 0;
-static volatile uint8_t fdcan1_rx_flag = 0;
+typedef struct {
+    BspFdcanFrame frames[BSP_FDCAN_RX_QUEUE_DEPTH];
+    volatile uint8_t head;
+    volatile uint8_t tail;
+    volatile uint32_t overflow_count;
+} BspFdcanRxQueue;
+
+/* ISR 单生产者、任务单消费者的静态环形队列。 */
+static BspFdcanRxQueue fdcan1_rx_queue;
 static TaskHandle_t fdcan1_rx_task_handle = NULL;
 
-/* FDCAN2 接收数据缓存 + 任务通知句柄 */
-static uint8_t fdcan2_rx_data[8] = {0};
-static uint16_t fdcan2_rx_id = 0;
-static uint8_t fdcan2_rx_len = 0;
-static volatile uint8_t fdcan2_rx_flag = 0;
+static BspFdcanRxQueue fdcan2_rx_queue;
 static TaskHandle_t fdcan2_rx_task_handle = NULL;
+
+static uint32_t fdcan_dlc_from_length(uint32_t len)
+{
+    static const uint32_t dlc[9] = {
+        FDCAN_DLC_BYTES_0, FDCAN_DLC_BYTES_1, FDCAN_DLC_BYTES_2,
+        FDCAN_DLC_BYTES_3, FDCAN_DLC_BYTES_4, FDCAN_DLC_BYTES_5,
+        FDCAN_DLC_BYTES_6, FDCAN_DLC_BYTES_7, FDCAN_DLC_BYTES_8
+    };
+    return dlc[(len <= 8U) ? len : 8U];
+}
+
+static uint8_t fdcan_length_from_dlc(uint32_t dlc)
+{
+    uint32_t len = dlc >> 16U;
+    return (uint8_t)((len <= 8U) ? len : 8U);
+}
+
+static void fdcan_queue_push_from_isr(BspFdcanRxQueue *queue,
+                                      const BspFdcanFrame *frame)
+{
+    uint8_t next = (uint8_t)((queue->head + 1U) % BSP_FDCAN_RX_QUEUE_DEPTH);
+    if (next == queue->tail) {
+        queue->overflow_count++;
+        return;
+    }
+
+    queue->frames[queue->head] = *frame;
+    __DMB();
+    queue->head = next;
+}
+
+static uint8_t fdcan_queue_pop(BspFdcanRxQueue *queue, uint16_t *id, uint8_t *buf)
+{
+    uint8_t tail = queue->tail;
+    if (tail == queue->head) {
+        return 0U;
+    }
+
+    BspFdcanFrame frame = queue->frames[tail];
+    __DMB();
+    queue->tail = (uint8_t)((tail + 1U) % BSP_FDCAN_RX_QUEUE_DEPTH);
+    *id = frame.id;
+    for (uint8_t i = 0U; i < frame.len; i++) {
+        buf[i] = frame.data[i];
+    }
+    return frame.len;
+}
 
 /**
 ************************************************************************
@@ -70,7 +117,7 @@ uint8_t fdcanx_send_data(FDCAN_HandleTypeDef *hfdcan, uint16_t id, uint8_t *data
     pTxHeader.Identifier = id;
     pTxHeader.IdType = FDCAN_STANDARD_ID;
     pTxHeader.TxFrameType = FDCAN_DATA_FRAME;
-    pTxHeader.DataLength = (len <= 8) ? len : 8;
+    pTxHeader.DataLength = fdcan_dlc_from_length(len);
     pTxHeader.ErrorStateIndicator = FDCAN_ESI_ACTIVE;
     pTxHeader.BitRateSwitch = FDCAN_BRS_OFF;
     pTxHeader.FDFormat = FDCAN_CLASSIC_CAN;
@@ -99,7 +146,7 @@ uint8_t fdcanx_receive(FDCAN_HandleTypeDef *hfdcan, uint16_t *rec_id, uint8_t *b
 	if(HAL_FDCAN_GetRxMessage(hfdcan, FDCAN_RX_FIFO0, &pRxHeader, buf) == HAL_OK)
 	{
 		*rec_id = pRxHeader.Identifier;
-		len = pRxHeader.DataLength;
+			len = fdcan_length_from_dlc(pRxHeader.DataLength);
 		return len;
 	}
 	return 0;
@@ -129,16 +176,12 @@ void fdcan1_register_rx_task(TaskHandle_t handle)
 **/
 uint8_t fdcan1_get_rx_data(uint16_t *id, uint8_t *buf)
 {
-	if(!fdcan1_rx_flag)
-		return 0;
+	return fdcan_queue_pop(&fdcan1_rx_queue, id, buf);
+}
 
-	*id = fdcan1_rx_id;
-	uint8_t len = fdcan1_rx_len;
-	for(uint8_t i = 0; i < len; i++)
-		buf[i] = fdcan1_rx_data[i];
-
-	fdcan1_rx_flag = 0;
-	return len;
+uint32_t fdcan1_get_rx_overflow_count(void)
+{
+    return fdcan1_rx_queue.overflow_count;
 }
 
 /**
@@ -165,28 +208,21 @@ void fdcan2_register_rx_task(TaskHandle_t handle)
 **/
 uint8_t fdcan2_get_rx_data(uint16_t *id, uint8_t *buf)
 {
-	if(!fdcan2_rx_flag)
-		return 0;
-
-	*id = fdcan2_rx_id;
-	uint8_t len = fdcan2_rx_len;
-	for(uint8_t i = 0; i < len; i++)
-		buf[i] = fdcan2_rx_data[i];
-
-	fdcan2_rx_flag = 0;
-	return len;
+	return fdcan_queue_pop(&fdcan2_rx_queue, id, buf);
 }
 
-/* RX callbacks */
-static uint8_t rx_data1[8] = {0};
-static uint16_t rec_id1;
+uint32_t fdcan2_get_rx_overflow_count(void)
+{
+    return fdcan2_rx_queue.overflow_count;
+}
 
 static void fdcan1_rx_callback(void)
 {
-	fdcan1_rx_len = fdcanx_receive(&hfdcan1, &fdcan1_rx_id, fdcan1_rx_data);
-	if(fdcan1_rx_len > 0)
+	BspFdcanFrame frame = {0};
+	frame.len = fdcanx_receive(&hfdcan1, &frame.id, frame.data);
+	if(frame.len > 0U)
 	{
-		fdcan1_rx_flag = 1;
+		fdcan_queue_push_from_isr(&fdcan1_rx_queue, &frame);
 		/* 通知注册的接收任务 */
 		BaseType_t xHigherPriorityTaskWoken = pdFALSE;
 		if(fdcan1_rx_task_handle != NULL)
@@ -199,10 +235,11 @@ static void fdcan1_rx_callback(void)
 
 static void fdcan2_rx_callback(void)
 {
-	fdcan2_rx_len = fdcanx_receive(&hfdcan2, &fdcan2_rx_id, fdcan2_rx_data);
-	if(fdcan2_rx_len > 0)
+	BspFdcanFrame frame = {0};
+	frame.len = fdcanx_receive(&hfdcan2, &frame.id, frame.data);
+	if(frame.len > 0U)
 	{
-		fdcan2_rx_flag = 1;
+		fdcan_queue_push_from_isr(&fdcan2_rx_queue, &frame);
 		/* 通知注册的接收任务 */
 		BaseType_t xHigherPriorityTaskWoken = pdFALSE;
 		if(fdcan2_rx_task_handle != NULL)

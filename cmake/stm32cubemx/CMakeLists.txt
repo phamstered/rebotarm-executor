@@ -43,9 +43,9 @@ set(MX_Application_Src
     ${CMAKE_CURRENT_SOURCE_DIR}/../../Core/Src/stm32h7xx_hal_timebase_tim.c
     ${CMAKE_CURRENT_SOURCE_DIR}/../../Core/Src/sysmem.c
     ${CMAKE_CURRENT_SOURCE_DIR}/../../Core/Src/syscalls.c
-    # 电机控制代码已注释
-    # ${CMAKE_CURRENT_SOURCE_DIR}/../../User/bsp_fdcan.c
-    # ${CMAKE_CURRENT_SOURCE_DIR}/../../User/damiao_protocol.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../User/bsp_fdcan.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../User/damiao_protocol.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../User/motor_bridge.c
     ${CMAKE_CURRENT_SOURCE_DIR}/../../startup_stm32h723xx.s
 )
 

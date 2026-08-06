@@ -57,6 +57,12 @@ const osThreadAttr_t defaultTask_attributes = {
   .priority = (osPriority_t) osPriorityNormal,
 };
 /* USER CODE BEGIN PV */
+static StaticTask_t motorControlTaskTcb;
+static StackType_t motorControlTaskStack[512];
+static StaticTask_t safetyTaskTcb;
+static StackType_t safetyTaskStack[384];
+static StaticTask_t microrosTaskTcb;
+static StackType_t microrosTaskStack[2500];
 
 /* USER CODE END PV */
 
@@ -74,6 +80,8 @@ void StartDefaultTask(void *argument);
 // void StartCan2RxTask(void *argument);
 // void StartDamiaoMotorTask(void *argument);  // 电机控制已注释
 void StartMicrorosTask(void *argument);
+void StartMotorControlTask(void *argument);
+void StartSafetyTask(void *argument);
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
@@ -113,12 +121,12 @@ int main(void)
 
   /* Initialize all configured peripherals */
   MX_GPIO_Init();
-  // MX_FDCAN1_Init();  // 电机控制已注释
-  // MX_FDCAN2_Init();  // 电机控制已注释
+  MX_FDCAN1_Init();
+  MX_FDCAN2_Init();
   /* USER CODE BEGIN 2 */
 
   MX_USB_DEVICE_Init();
-  // bsp_can_filter_start();  // 电机控制已注释，CAN 过滤器不需要
+  bsp_can_filter_start();
 
   /* USER CODE END 2 */
 
@@ -166,11 +174,18 @@ int main(void)
   //   .stack_size = 512 * 4,
   //   .priority = osPriorityNormal,
   // });
-  osThreadNew(StartMicrorosTask, NULL, &(const osThreadAttr_t){
-    .name = "microrosTask",
-    .stack_size = 3000 * 4,  // micro-ROS 需要较大栈空间
-    .priority = osPriorityNormal,
-  });
+  xTaskCreateStatic(StartMicrorosTask, "microros",
+                    sizeof(microrosTaskStack) / sizeof(microrosTaskStack[0]),
+                    NULL, (UBaseType_t)osPriorityNormal,
+                    microrosTaskStack, &microrosTaskTcb);
+  xTaskCreateStatic(StartMotorControlTask, "motorControl",
+                    sizeof(motorControlTaskStack) / sizeof(motorControlTaskStack[0]),
+                    NULL, (UBaseType_t)osPriorityRealtime,
+                    motorControlTaskStack, &motorControlTaskTcb);
+  xTaskCreateStatic(StartSafetyTask, "safety",
+                    sizeof(safetyTaskStack) / sizeof(safetyTaskStack[0]),
+                    NULL, (UBaseType_t)osPriorityHigh,
+                    safetyTaskStack, &safetyTaskTcb);
   /* USER CODE END RTOS_THREADS */
 
   /* USER CODE BEGIN RTOS_EVENTS */
