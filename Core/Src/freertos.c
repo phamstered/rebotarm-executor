@@ -24,7 +24,7 @@
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
-// #include "vofa.h"  // 注释掉 vofa，USB CDC 供 micro-ROS 使用
+#include "vofa.h"
 #include "cmsis_os2.h"
 #include "bsp_fdcan.h"
 #include "damiao_protocol.h"
@@ -32,8 +32,10 @@
 
 // micro-ROS includes
 #include <stdbool.h>
+#include <math.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <string.h>
 #include <rcl/rcl.h>
 #include <rcl/error_handling.h>
 #include <rclc/rclc.h>
@@ -95,6 +97,7 @@ void StartMotorControlTask(void *argument)
 {
   (void)argument;
   TickType_t wake = xTaskGetTickCount();
+  fdcan1_register_rx_task(xTaskGetCurrentTaskHandle());
   motor_bridge_init();
   for (;;) {
     motor_bridge_control_step(HAL_GetTick());
@@ -129,6 +132,319 @@ void StartSafetyTask(void *argument)
   *         CAN ID: 0x100, 8 bytes
   */
 extern FDCAN_HandleTypeDef hfdcan1;
+
+#define DAMIAO_TEST_MOTOR_ID          0x01U
+#define DAMIAO_TEST_KP                8.0f
+#define DAMIAO_TEST_KD                2.0f
+#define DAMIAO_TEST_ROTATION_RAD      6.283185307f
+#define DAMIAO_TEST_RAMP_RAD_S        0.5f
+#define DAMIAO_TEST_PERIOD_MS         20U
+#define DAMIAO_TEST_FEEDBACK_LIMIT_MS 100U
+
+static const DamiaoLimits damiao_test_limits = {
+  .p_min = -12.5f,
+  .p_max = 12.5f,
+  .v_min = -30.0f,
+  .v_max = 30.0f,
+  .t_min = -5.0f,
+  .t_max = 5.0f
+};
+
+static DamiaoMotorState damiao_test_motor;
+volatile float damiao_test_phase;
+volatile float damiao_test_target;
+volatile float damiao_test_vbus;
+volatile uint32_t damiao_test_status;
+
+static int damiao_test_can_send(uint16_t can_id, const uint8_t *data, void *ctx)
+{
+  (void)ctx;
+  return fdcanx_send_data(&hfdcan1, can_id, (uint8_t *)data, DAMIAO_DLC) == 0U
+      ? 0 : -1;
+}
+
+static int damiao_test_can_recv(uint16_t *can_id, uint8_t *data,
+                                uint32_t timeout_ms, void *ctx)
+{
+  (void)ctx;
+  uint32_t start = HAL_GetTick();
+  for (;;) {
+    if (fdcan1_get_rx_data(can_id, data) == DAMIAO_DLC) {
+      return 0;
+    }
+    uint32_t elapsed = HAL_GetTick() - start;
+    if (elapsed >= timeout_ms) {
+      return -1;
+    }
+    if (ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(timeout_ms - elapsed)) == 0U) {
+      return -1;
+    }
+  }
+}
+
+static void damiao_test_sleep(uint32_t ms, void *ctx)
+{
+  (void)ctx;
+  osDelay(ms);
+}
+
+static void damiao_test_telemetry(float phase, float target)
+{
+  damiao_test_phase = phase;
+  damiao_test_target = target;
+  damiao_test_status = damiao_test_motor.last_feedback.status_code;
+  vofa_send_data(0U, phase);
+  vofa_send_data(1U, target);
+  vofa_send_data(2U, damiao_test_motor.last_feedback.pos);
+  vofa_send_data(3U, damiao_test_motor.last_feedback.vel);
+  vofa_send_data(4U, damiao_test_motor.last_feedback.torq);
+  vofa_sendframetail();
+}
+
+static void damiao_test_disable_forever(float error_code)
+{
+  for (;;) {
+    (void)damiao_motor_disable(&damiao_test_motor, damiao_test_can_send, NULL);
+    damiao_test_telemetry(error_code, 0.0f);
+    osDelay(100U);
+  }
+}
+
+static bool damiao_test_feedback_safe(float target)
+{
+  const DamiaoFeedback *feedback = &damiao_test_motor.last_feedback;
+  return damiao_test_motor.has_feedback &&
+      isfinite(feedback->pos) && isfinite(feedback->vel) &&
+      isfinite(feedback->torq) &&
+      feedback->status_code == DAMIAO_STATUS_ENABLED &&
+      fabsf(feedback->pos) <= 7.0f &&
+      fabsf(feedback->pos - target) <= 0.50f &&
+      fabsf(feedback->vel) <= 1.50f && fabsf(feedback->torq) <= 1.0f;
+}
+
+static bool damiao_test_run_ramp(float phase, float from, float to)
+{
+  uint8_t command[DAMIAO_DLC];
+  uint32_t start = HAL_GetTick();
+  float distance = fabsf(to - from);
+  uint32_t duration_ms = (uint32_t)(distance / DAMIAO_TEST_RAMP_RAD_S * 1000.0f);
+
+  while ((uint32_t)(HAL_GetTick() - start) <= duration_ms) {
+    uint32_t cycle_start = HAL_GetTick();
+    float progress = duration_ms == 0U ? 1.0f :
+        (float)(cycle_start - start) / (float)duration_ms;
+    if (progress > 1.0f) progress = 1.0f;
+    float target = from + (to - from) * progress;
+    damiao_encode_mit_cmd(target, 0.0f, 0.0f, DAMIAO_TEST_KP, DAMIAO_TEST_KD,
+                          &damiao_test_limits, command);
+    if (damiao_test_can_send(DAMIAO_TEST_MOTOR_ID, command, NULL) != 0) {
+      return false;
+    }
+
+    bool received = false;
+    uint32_t feedback_start = HAL_GetTick();
+    while ((uint32_t)(HAL_GetTick() - feedback_start) < DAMIAO_TEST_FEEDBACK_LIMIT_MS) {
+      uint16_t can_id;
+      uint8_t data[DAMIAO_DLC];
+      if (damiao_test_can_recv(&can_id, data, 10U, NULL) == 0) {
+        damiao_motor_state_process_frame(&damiao_test_motor, can_id, data);
+        if (can_id == damiao_test_motor.feedback_id) {
+          received = true;
+          break;
+        }
+      }
+    }
+    if (!received || !damiao_test_feedback_safe(target)) {
+      return false;
+    }
+    damiao_test_telemetry(phase, target);
+
+    uint32_t elapsed = HAL_GetTick() - cycle_start;
+    if (elapsed < DAMIAO_TEST_PERIOD_MS) {
+      osDelay(DAMIAO_TEST_PERIOD_MS - elapsed);
+    }
+  }
+  return true;
+}
+
+static bool damiao_test_hold(float phase, float target, uint32_t duration_ms)
+{
+  uint8_t command[DAMIAO_DLC];
+  uint32_t start = HAL_GetTick();
+  damiao_encode_mit_cmd(target, 0.0f, 0.0f, DAMIAO_TEST_KP, DAMIAO_TEST_KD,
+                        &damiao_test_limits, command);
+  while ((uint32_t)(HAL_GetTick() - start) < duration_ms) {
+    if (damiao_test_can_send(DAMIAO_TEST_MOTOR_ID, command, NULL) != 0) {
+      return false;
+    }
+    bool received = false;
+    uint32_t feedback_start = HAL_GetTick();
+    while ((uint32_t)(HAL_GetTick() - feedback_start) <
+           DAMIAO_TEST_FEEDBACK_LIMIT_MS) {
+      uint16_t can_id;
+      uint8_t data[DAMIAO_DLC];
+      if (damiao_test_can_recv(&can_id, data, 10U, NULL) == 0) {
+        damiao_motor_state_process_frame(&damiao_test_motor, can_id, data);
+        if (can_id == damiao_test_motor.feedback_id) {
+          received = true;
+          break;
+        }
+      }
+    }
+    if (!received || !damiao_test_feedback_safe(target)) {
+      return false;
+    }
+    damiao_test_telemetry(phase, target);
+    osDelay(DAMIAO_TEST_PERIOD_MS);
+  }
+  return true;
+}
+
+static bool damiao_test_wait_status(uint8_t expected_status,
+                                    uint32_t timeout_ms)
+{
+  uint32_t start = HAL_GetTick();
+  while ((uint32_t)(HAL_GetTick() - start) < timeout_ms) {
+    uint16_t can_id;
+    uint8_t data[DAMIAO_DLC];
+    if (damiao_test_can_recv(&can_id, data, 10U, NULL) == 0 &&
+        can_id == damiao_test_motor.feedback_id) {
+      damiao_motor_state_process_frame(&damiao_test_motor, can_id, data);
+      if (damiao_test_motor.last_feedback.status_code == expected_status) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+void StartDamiaoMotorTask(void *argument)
+{
+  (void)argument;
+  uint8_t command[DAMIAO_DLC];
+  uint16_t can_id;
+  uint8_t data[DAMIAO_DLC];
+
+  fdcan1_register_rx_task(xTaskGetCurrentTaskHandle());
+  damiao_motor_state_init(&damiao_test_motor, DAMIAO_TEST_MOTOR_ID,
+                          DAMIAO_TEST_MOTOR_ID + 0x10U, &damiao_test_limits);
+  DamiaoModeSwitchCtx mode_ctx = {
+    .motor_id = DAMIAO_TEST_MOTOR_ID,
+    .send = damiao_test_can_send,
+    .recv = damiao_test_can_recv,
+    .sleep = damiao_test_sleep,
+    .user_ctx = NULL,
+    .limits = &damiao_test_limits
+  };
+
+  osDelay(1000U);
+  (void)damiao_motor_disable(&damiao_test_motor, damiao_test_can_send, NULL);
+  osDelay(50U);
+  while (fdcan1_get_rx_data(&can_id, data) == DAMIAO_DLC) { }
+
+  if (damiao_motor_request_feedback_state(&damiao_test_motor, &mode_ctx, 300U) !=
+          DAMIAO_ERR_OK ||
+      damiao_test_motor.last_feedback.status_code != DAMIAO_STATUS_DISABLED ||
+      !isfinite(damiao_test_motor.last_feedback.pos) ||
+      !isfinite(damiao_test_motor.last_feedback.vel) ||
+      !isfinite(damiao_test_motor.last_feedback.torq) ||
+      fabsf(damiao_test_motor.last_feedback.pos) > 12.5f ||
+      fabsf(damiao_test_motor.last_feedback.vel) > 0.20f ||
+      fabsf(damiao_test_motor.last_feedback.torq) > 1.0f) {
+    damiao_test_disable_forever(-11.0f);
+  }
+  if (damiao_ensure_control_mode(&mode_ctx, DAMIAO_MODE_MIT, 1000U) !=
+      DAMIAO_ERR_OK) {
+    damiao_test_disable_forever(-12.0f);
+  }
+
+  uint32_t vbus_raw = 0U;
+  if (damiao_read_register_u32(&mode_ctx, 60U, &vbus_raw, 300U) ==
+      DAMIAO_ERR_OK) {
+    memcpy((void *)&damiao_test_vbus, &vbus_raw, sizeof(vbus_raw));
+  } else {
+    damiao_test_vbus = -1.0f;
+  }
+
+  if (damiao_motor_disable(&damiao_test_motor, damiao_test_can_send, NULL) !=
+      DAMIAO_ERR_OK) {
+    damiao_test_disable_forever(-13.0f);
+  }
+  bool zeroed = false;
+  for (uint32_t attempt = 0U; attempt < 5U && !zeroed; attempt++) {
+    if (damiao_motor_set_zero_position(&damiao_test_motor,
+                                       damiao_test_can_send,
+                                       damiao_test_sleep, NULL) !=
+        DAMIAO_ERR_OK) {
+      break;
+    }
+    osDelay(50U);
+    if (damiao_motor_request_feedback_state(&damiao_test_motor, &mode_ctx,
+                                            300U) == DAMIAO_ERR_OK &&
+        damiao_test_motor.last_feedback.status_code == DAMIAO_STATUS_DISABLED &&
+        fabsf(damiao_test_motor.last_feedback.pos) <= 0.05f) {
+      zeroed = true;
+    }
+  }
+  if (!zeroed) {
+    damiao_test_disable_forever(-13.0f);
+  }
+  damiao_test_telemetry(1.0f, 0.0f);
+
+  damiao_encode_mit_cmd(0.0f, 0.0f, 0.0f, 0.0f, 0.0f,
+                        &damiao_test_limits, command);
+  if (damiao_test_can_send(DAMIAO_TEST_MOTOR_ID, command, NULL) != 0) {
+    damiao_test_disable_forever(-14.0f);
+  }
+  bool enabled = false;
+  for (uint32_t attempt = 0U; attempt < 5U && !enabled; attempt++) {
+    if (damiao_motor_enable(&damiao_test_motor, damiao_test_can_send, NULL) !=
+        DAMIAO_ERR_OK) {
+      break;
+    }
+    osDelay(50U);
+    if (damiao_motor_request_feedback_state(&damiao_test_motor, &mode_ctx,
+                                            300U) == DAMIAO_ERR_OK &&
+        damiao_test_motor.last_feedback.status_code == DAMIAO_STATUS_ENABLED) {
+      enabled = true;
+    }
+  }
+  if (!enabled) {
+    damiao_test_disable_forever(-15.0f);
+  }
+  damiao_test_telemetry(2.0f, 0.0f);
+
+  if (!damiao_test_hold(2.0f, 0.0f, 500U)) {
+    damiao_test_disable_forever(-16.0f);
+  }
+  if (!damiao_test_run_ramp(3.0f, 0.0f, DAMIAO_TEST_ROTATION_RAD)) {
+    damiao_test_disable_forever(-17.0f);
+  }
+  if (!damiao_test_hold(4.0f, DAMIAO_TEST_ROTATION_RAD, 500U)) {
+    damiao_test_disable_forever(-18.0f);
+  }
+  if (!damiao_test_run_ramp(5.0f, DAMIAO_TEST_ROTATION_RAD, 0.0f)) {
+    damiao_test_disable_forever(-19.0f);
+  }
+  if (!damiao_test_hold(6.0f, 0.0f, 2000U) ||
+      fabsf(damiao_test_motor.last_feedback.pos) > 0.05f) {
+    damiao_test_disable_forever(-20.0f);
+  }
+
+  bool disabled = false;
+  for (uint32_t attempt = 0U; attempt < 5U && !disabled; attempt++) {
+    while (fdcan1_get_rx_data(&can_id, data) == DAMIAO_DLC) { }
+    if (damiao_motor_disable(&damiao_test_motor, damiao_test_can_send, NULL) !=
+        DAMIAO_ERR_OK) {
+      break;
+    }
+    disabled = damiao_test_wait_status(DAMIAO_STATUS_DISABLED, 200U);
+  }
+  if (!disabled) {
+    damiao_test_disable_forever(-21.0f);
+  }
+  damiao_test_disable_forever(7.0f);
+}
 //
 // void StartCanDemoTask(void *argument)
 // {

@@ -60,7 +60,7 @@ extern "C" {
 #define DAMIAO_ENSURE_MODE_SETTLE_MS           20
 #define DAMIAO_ENSURE_MODE_VERIFY_ATTEMPTS     3
 #define DAMIAO_ENSURE_MODE_VERIFY_RETRY_GAP_MS 10
-#define DAMIAO_ENSURE_MODE_READ_TIMEOUT_MS     20
+#define DAMIAO_ENSURE_MODE_READ_TIMEOUT_MS     100
 
 /*===========================================================================
  * Type Definitions

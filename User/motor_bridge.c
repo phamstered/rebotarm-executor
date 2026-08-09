@@ -15,6 +15,8 @@
 #define DISABLE_TIMEOUT_MS 500U
 #define FEEDBACK_TIMEOUT_MS 100U
 #define CONTROL_PERIOD_MS 2U
+#define ENABLE_RETRY_MS 20U
+#define ENABLE_TIMEOUT_MS 150U
 
 /* Conservative bring-up limits. Increase only after single-motor evidence. */
 #define COMMAND_POSITION_LIMIT_RAD 0.35f
@@ -37,11 +39,16 @@ typedef struct {
     uint32_t last_command_ms;
     bool have_command;
     bool motor_enabled;
+    bool enable_pending;
+    uint32_t enable_started_ms;
+    uint32_t last_enable_ms;
     bool hold_latched;
     float hold_position;
+    uint8_t drive_status;
 } MotorBridgeState;
 
 static MotorBridgeState state;
+static DamiaoMotorState motor_state;
 
 static bool sequence_is_newer(uint32_t candidate, uint32_t current)
 {
@@ -90,6 +97,37 @@ static bool send_frame(uint16_t can_id, uint8_t *data)
     return fdcanx_send_data(&hfdcan1, can_id, data, DAMIAO_DLC) == 0U;
 }
 
+static int protocol_send(uint16_t can_id, const uint8_t *data, void *ctx)
+{
+    (void)ctx;
+    return send_frame(can_id, (uint8_t *)data) ? 0 : -1;
+}
+
+static int protocol_recv(uint16_t *can_id, uint8_t *data,
+                         uint32_t timeout_ms, void *ctx)
+{
+    (void)ctx;
+    uint32_t start = HAL_GetTick();
+    for (;;) {
+        if (fdcan1_get_rx_data(can_id, data) == DAMIAO_DLC) {
+            return 0;
+        }
+        uint32_t elapsed = HAL_GetTick() - start;
+        if (elapsed >= timeout_ms) {
+            return -1;
+        }
+        if (ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(timeout_ms - elapsed)) == 0U) {
+            return -1;
+        }
+    }
+}
+
+static void protocol_sleep(uint32_t ms, void *ctx)
+{
+    (void)ctx;
+    vTaskDelay(pdMS_TO_TICKS(ms));
+}
+
 static void send_disable(void)
 {
     uint8_t data[DAMIAO_DLC];
@@ -114,6 +152,31 @@ void motor_bridge_init(void)
     state.snapshot.mode = MOTOR_MODE_DISABLE;
     state.snapshot.active_joint_mask = MOTOR_BRIDGE_ACTIVE_JOINT_MASK;
     send_disable();
+
+    damiao_motor_state_init(&motor_state, BASE_MOTOR_ID, BASE_FEEDBACK_ID,
+                            &motor_limits);
+    DamiaoModeSwitchCtx mode_ctx = {
+        .motor_id = BASE_MOTOR_ID,
+        .send = protocol_send,
+        .recv = protocol_recv,
+        .sleep = protocol_sleep,
+        .user_ctx = NULL,
+        .limits = &motor_limits
+    };
+    if (damiao_motor_request_feedback_state(&motor_state, &mode_ctx, 300U) !=
+            DAMIAO_ERR_OK ||
+        damiao_ensure_control_mode(&mode_ctx, DAMIAO_MODE_MIT, 300U) !=
+            DAMIAO_ERR_OK) {
+        state.snapshot.fault_code = MOTOR_FAULT_INIT;
+        send_disable();
+        return;
+    }
+    state.snapshot.position = motor_state.last_feedback.pos;
+    state.snapshot.velocity = motor_state.last_feedback.vel;
+    state.snapshot.effort = motor_state.last_feedback.torq;
+    state.snapshot.last_feedback_ms = HAL_GetTick();
+    state.snapshot.feedback_valid = true;
+    state.drive_status = motor_state.last_feedback.status_code;
 }
 
 bool motor_bridge_accept_command(const MotorBridgeCommand *command, uint32_t now_ms)
@@ -154,6 +217,8 @@ static void consume_feedback(uint32_t now_ms)
             state.snapshot.last_feedback_ms = now_ms;
             state.snapshot.feedback_valid = isfinite(feedback.pos) &&
                 isfinite(feedback.vel) && isfinite(feedback.torq);
+            state.drive_status = feedback.status_code;
+            state.motor_enabled = feedback.status_code == DAMIAO_STATUS_ENABLED;
             if (feedback.status_code >= DAMIAO_STATUS_OVER_VOLTAGE) {
                 state.snapshot.fault_code = MOTOR_FAULT_DRIVE;
                 set_mode(MOTOR_MODE_DISABLE);
@@ -172,18 +237,34 @@ void motor_bridge_control_step(uint32_t now_ms)
         if (state.motor_enabled) {
             send_disable();
         }
+        state.enable_pending = false;
         return;
     }
 
     if (!state.motor_enabled) {
-        damiao_encode_enable_cmd(data);
-        if (!send_frame(damiao_get_mit_can_id(BASE_MOTOR_ID), data)) {
-            state.snapshot.fault_code = MOTOR_FAULT_CAN_TX;
+        if (!state.enable_pending) {
+            state.enable_pending = true;
+            state.enable_started_ms = now_ms;
+            state.last_enable_ms = now_ms - ENABLE_RETRY_MS;
+        } else if ((uint32_t)(now_ms - state.enable_started_ms) >
+                   ENABLE_TIMEOUT_MS) {
+            state.snapshot.fault_code = MOTOR_FAULT_ENABLE_TIMEOUT;
             set_mode(MOTOR_MODE_DISABLE);
+            send_disable();
             return;
         }
-        state.motor_enabled = true;
+        if ((uint32_t)(now_ms - state.last_enable_ms) >= ENABLE_RETRY_MS) {
+            damiao_encode_enable_cmd(data);
+            if (!send_frame(damiao_get_mit_can_id(BASE_MOTOR_ID), data)) {
+                state.snapshot.fault_code = MOTOR_FAULT_CAN_TX;
+                set_mode(MOTOR_MODE_DISABLE);
+                return;
+            }
+            state.last_enable_ms = now_ms;
+        }
+        return;
     }
+    state.enable_pending = false;
 
     if (state.snapshot.mode == MOTOR_MODE_HOLD) {
         if (!state.hold_latched) {
