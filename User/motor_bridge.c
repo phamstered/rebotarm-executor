@@ -17,6 +17,7 @@
 #define CONTROL_PERIOD_MS 2U
 #define ENABLE_RETRY_MS 20U
 #define ENABLE_TIMEOUT_MS 150U
+#define DISABLED_FEEDBACK_REQUEST_MS 50U
 
 /* Conservative bring-up limits. Increase only after single-motor evidence. */
 #define COMMAND_POSITION_LIMIT_RAD 0.35f
@@ -42,6 +43,7 @@ typedef struct {
     bool enable_pending;
     uint32_t enable_started_ms;
     uint32_t last_enable_ms;
+    uint32_t last_feedback_request_ms;
     bool hold_latched;
     float hold_position;
     uint8_t drive_status;
@@ -177,6 +179,7 @@ void motor_bridge_init(void)
     state.snapshot.last_feedback_ms = HAL_GetTick();
     state.snapshot.feedback_valid = true;
     state.drive_status = motor_state.last_feedback.status_code;
+    state.last_feedback_request_ms = HAL_GetTick();
 }
 
 bool motor_bridge_accept_command(const MotorBridgeCommand *command, uint32_t now_ms)
@@ -232,12 +235,34 @@ void motor_bridge_control_step(uint32_t now_ms)
     uint8_t data[DAMIAO_DLC];
     consume_feedback(now_ms);
 
-    if (state.snapshot.mode == MOTOR_MODE_DISABLE ||
-        !state.snapshot.feedback_valid || !state.have_command) {
+    /* A disabled Damiao drive does not stream feedback autonomously. Poll it
+     * so a later ROS command can be safely armed from a fresh snapshot. */
+    if (!state.motor_enabled &&
+        (uint32_t)(now_ms - state.last_feedback_request_ms) >=
+            DISABLED_FEEDBACK_REQUEST_MS) {
+        damiao_encode_feedback_request_cmd(BASE_MOTOR_ID, data);
+        if (!send_frame(damiao_get_register_can_id(), data)) {
+            state.snapshot.fault_code = MOTOR_FAULT_CAN_TX;
+            set_mode(MOTOR_MODE_DISABLE);
+            return;
+        }
+        state.last_feedback_request_ms = now_ms;
+    }
+
+    if (state.snapshot.mode == MOTOR_MODE_DISABLE || !state.have_command) {
         if (state.motor_enabled) {
             send_disable();
         }
         state.enable_pending = false;
+        return;
+    }
+
+    if (!state.snapshot.feedback_valid) {
+        if ((uint32_t)(now_ms - state.last_command_ms) > FEEDBACK_TIMEOUT_MS) {
+            state.snapshot.fault_code = MOTOR_FAULT_FEEDBACK_TIMEOUT;
+            set_mode(MOTOR_MODE_DISABLE);
+            send_disable();
+        }
         return;
     }
 

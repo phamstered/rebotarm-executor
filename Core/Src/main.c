@@ -57,7 +57,7 @@ const osThreadAttr_t defaultTask_attributes = {
   .priority = (osPriority_t) osPriorityNormal,
 };
 /* USER CODE BEGIN PV */
-#define DAMIAO_DIRECT_TEST 1
+#define DAMIAO_DIRECT_TEST 0
 
 #if DAMIAO_DIRECT_TEST
 static StaticTask_t damiaoTestTaskTcb;
