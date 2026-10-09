@@ -2,7 +2,7 @@
 
 ## Project Structure & Module Organization
 
-This repository contains STM32H723 robotic-arm firmware. Application startup, interrupts, and FreeRTOS tasks live in `Core/Src/`, with matching headers in `Core/Inc/`. Device-specific modules such as the Damiao motor protocol and FDCAN wrapper belong in `User/`. USB CDC code is under `USB_DEVICE/`, while `vofa+/` provides telemetry. Treat `Drivers/`, `Middlewares/`, and files generated from `rebotarm_executor.ioc` as vendor or CubeMX-managed code. Build definitions are split between the root `CMakeLists.txt` and `cmake/stm32cubemx/`; integration notes live in `docs/`, and utilities in `scripts/`.
+Application startup and FreeRTOS tasks live in `Core/Src/`, with headers in `Core/Inc/`. Damiao and FDCAN modules belong in `User/`; USB CDC is under `USB_DEVICE/`, telemetry under `vofa+/`, notes under `docs/`, and utilities under `scripts/`. Treat `Drivers/`, `Middlewares/`, and `.ioc`-generated files as vendor/CubeMX-managed code.
 
 ## Build, Test, and Development Commands
 
@@ -15,15 +15,22 @@ This repository contains STM32H723 robotic-arm firmware. Application startup, in
 
 ## Coding Style & Naming Conventions
 
-Use C11 and follow the existing STM32 HAL style: four-space indentation, braces on the next line for functions, and `snake_case` for project functions and files (for example, `damiao_protocol.c`). Keep public declarations in paired `.h` files and use uppercase include guards. In CubeMX-generated files, place every manual change inside `/* USER CODE BEGIN ... */` blocks so regeneration preserves it. Prefer CMSIS-RTOS v2 APIs (`osThreadNew`, `osDelay`) for tasks. Do not reformat vendor code or mix unrelated generated changes into a patch.
+Use C11 and STM32 HAL style: four-space indentation, next-line function braces, and `snake_case` project symbols/files. Keep public declarations in paired `.h` files with uppercase guards. Put manual generated-file changes inside `/* USER CODE BEGIN ... */` blocks. Prefer CMSIS-RTOS v2 APIs and do not reformat vendor code.
 
 ## Testing Guidelines
 
 There is no automated unit-test target or coverage threshold. Every change must compile in Debug; build Release when changing optimization-sensitive, timing, or linker behavior. For hardware-facing changes, document the board setup and verify relevant FDCAN, motor, or USB CDC behavior. Include concise serial output or observed results in the pull request.
 
+## ROS 2 Interface Contract
+
+[`docs/ros2-interface.md`](docs/ros2-interface.md) is the authoritative firmware interface reference. Any change to a topic name, message type or field meaning, joint ordering, QoS, publish rate, control mode, limit, timeout, fault code, or maintenance command must update that document in the same patch. Keep documented behavior aligned with the implementation, including incomplete modes.
+
+Use [`docs/microros-session-stability.md`](docs/microros-session-stability.md)
+for the non-moving 100 Hz XRCE load test and Agent reconnect checks.
+
 ## Commit & Pull Request Guidelines
 
-History follows Conventional Commit-style subjects such as `feat: integrate micro-ROS...` and `chore: ...`. Use an imperative, scoped summary (`fix: handle FDCAN timeout`) and keep commits focused. Pull requests should explain intent, identify affected peripherals/tasks, list build and hardware checks, and link related issues. Attach logs or screenshots for telemetry changes, and call out modifications to `.ioc`, linker scripts, pin mappings, clocks, or interrupt priorities.
+Use focused Conventional Commit-style subjects such as `fix: handle FDCAN timeout`. Pull requests should explain intent, affected peripherals/tasks, build and hardware checks, and related issues. Attach relevant telemetry evidence and call out `.ioc`, linker, pin, clock, or interrupt-priority changes.
 
 ## Safety & Configuration
 

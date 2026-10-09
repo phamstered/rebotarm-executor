@@ -31,8 +31,10 @@ static uint32_t fdcan_dlc_from_length(uint32_t len)
 
 static uint8_t fdcan_length_from_dlc(uint32_t dlc)
 {
-    uint32_t len = dlc >> 16U;
-    return (uint8_t)((len <= 8U) ? len : 8U);
+    /* HAL_FDCAN_GetRxMessage returns the raw DLC code (0..15), not the
+     * shifted FDCAN_DLC_BYTES_x value used when transmitting. */
+    uint32_t code = (dlc <= 0x0FU) ? dlc : (dlc >> 16U);
+    return (uint8_t)((code <= 8U) ? code : 8U);
 }
 
 static void fdcan_queue_push_from_isr(BspFdcanRxQueue *queue,

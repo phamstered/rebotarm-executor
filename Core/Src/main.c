@@ -57,12 +57,19 @@ const osThreadAttr_t defaultTask_attributes = {
   .priority = (osPriority_t) osPriorityNormal,
 };
 /* USER CODE BEGIN PV */
+#define DAMIAO_DIRECT_TEST 0
+
+#if DAMIAO_DIRECT_TEST
+static StaticTask_t damiaoTestTaskTcb;
+static StackType_t damiaoTestTaskStack[768];
+#else
 static StaticTask_t motorControlTaskTcb;
 static StackType_t motorControlTaskStack[512];
 static StaticTask_t safetyTaskTcb;
 static StackType_t safetyTaskStack[384];
 static StaticTask_t microrosTaskTcb;
 static StackType_t microrosTaskStack[2500];
+#endif
 
 /* USER CODE END PV */
 
@@ -78,7 +85,7 @@ void StartDefaultTask(void *argument);
 // void StartVofaTask(void *argument);
 // void StartCanDemoTask(void *argument);
 // void StartCan2RxTask(void *argument);
-// void StartDamiaoMotorTask(void *argument);  // 电机控制已注释
+void StartDamiaoMotorTask(void *argument);
 void StartMicrorosTask(void *argument);
 void StartMotorControlTask(void *argument);
 void StartSafetyTask(void *argument);
@@ -174,6 +181,12 @@ int main(void)
   //   .stack_size = 512 * 4,
   //   .priority = osPriorityNormal,
   // });
+#if DAMIAO_DIRECT_TEST
+  xTaskCreateStatic(StartDamiaoMotorTask, "damiaoTest",
+                    sizeof(damiaoTestTaskStack) / sizeof(damiaoTestTaskStack[0]),
+                    NULL, (UBaseType_t)osPriorityNormal,
+                    damiaoTestTaskStack, &damiaoTestTaskTcb);
+#else
   xTaskCreateStatic(StartMicrorosTask, "microros",
                     sizeof(microrosTaskStack) / sizeof(microrosTaskStack[0]),
                     NULL, (UBaseType_t)osPriorityNormal,
@@ -186,6 +199,7 @@ int main(void)
                     sizeof(safetyTaskStack) / sizeof(safetyTaskStack[0]),
                     NULL, (UBaseType_t)osPriorityHigh,
                     safetyTaskStack, &safetyTaskTcb);
+#endif
   /* USER CODE END RTOS_THREADS */
 
   /* USER CODE BEGIN RTOS_EVENTS */
@@ -350,7 +364,8 @@ static void MX_FDCAN2_Init(void)
   hfdcan2.Init.DataSyncJumpWidth = 20;
   hfdcan2.Init.DataTimeSeg1 = 59;
   hfdcan2.Init.DataTimeSeg2 = 20;
-  hfdcan2.Init.MessageRAMOffset = 0;
+  /* FDCAN1 uses 65 words: 1 std filter + 8 RX elements + 8 TX elements. */
+  hfdcan2.Init.MessageRAMOffset = 65;
   hfdcan2.Init.StdFiltersNbr = 1;
   hfdcan2.Init.ExtFiltersNbr = 0;
   hfdcan2.Init.RxFifo0ElmtsNbr = 8;

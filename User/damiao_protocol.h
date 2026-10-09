@@ -31,6 +31,7 @@ extern "C" {
 #define DAMIAO_CMD_ENABLE       0xFC
 #define DAMIAO_CMD_DISABLE      0xFD
 #define DAMIAO_CMD_SET_ZERO     0xFE
+#define DAMIAO_REG_OUTPUT_POS_OFFSET 54U
 #define DAMIAO_CMD_CLEAR_ERROR  0xFB
 
 /** Register command markers */
@@ -60,7 +61,7 @@ extern "C" {
 #define DAMIAO_ENSURE_MODE_SETTLE_MS           20
 #define DAMIAO_ENSURE_MODE_VERIFY_ATTEMPTS     3
 #define DAMIAO_ENSURE_MODE_VERIFY_RETRY_GAP_MS 10
-#define DAMIAO_ENSURE_MODE_READ_TIMEOUT_MS     20
+#define DAMIAO_ENSURE_MODE_READ_TIMEOUT_MS     100
 
 /*===========================================================================
  * Type Definitions

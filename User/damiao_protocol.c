@@ -269,24 +269,20 @@ int damiao_read_register_u32(const DamiaoModeSwitchCtx *ctx, uint8_t rid,
         return DAMIAO_ERR_CAN_WRITE;
     }
 
-    /* Wait for register reply */
-    if (ctx->recv(&recv_id, recv_data, timeout_ms, ctx->user_ctx) != 0) {
-        return DAMIAO_ERR_TIMEOUT;
+    /* Feedback and register replies share the RX queue. Skip unrelated frames
+     * until the requested RID arrives or the timeout budget is exhausted. */
+    uint32_t elapsed = 0U;
+    while (elapsed < timeout_ms) {
+        uint32_t wait_ms = timeout_ms - elapsed;
+        if (wait_ms > 5U) wait_ms = 5U;
+        if (ctx->recv(&recv_id, recv_data, wait_ms, ctx->user_ctx) == 0 &&
+            damiao_decode_register_value(recv_data, &rv) && rv.rid == rid) {
+            *value = damiao_decode_register_u32(rv.data);
+            return DAMIAO_ERR_OK;
+        }
+        elapsed += wait_ms;
     }
-
-    /* Decode and validate */
-    if (!damiao_is_register_reply(recv_data)) {
-        return DAMIAO_ERR_CAN_READ;
-    }
-    if (!damiao_decode_register_value(recv_data, &rv)) {
-        return DAMIAO_ERR_CAN_READ;
-    }
-    if (rv.rid != rid) {
-        return DAMIAO_ERR_CAN_READ;
-    }
-
-    *value = damiao_decode_register_u32(rv.data);
-    return DAMIAO_ERR_OK;
+    return DAMIAO_ERR_TIMEOUT;
 }
 
 int damiao_write_register_u32(const DamiaoModeSwitchCtx *ctx, uint8_t rid,
@@ -305,16 +301,17 @@ int damiao_write_register_u32(const DamiaoModeSwitchCtx *ctx, uint8_t rid,
         return DAMIAO_ERR_CAN_WRITE;
     }
 
-    /* Wait for write ACK */
-    if (ctx->recv(&recv_id, recv_data, timeout_ms, ctx->user_ctx) != 0) {
-        return DAMIAO_ERR_TIMEOUT;
+    uint32_t elapsed = 0U;
+    while (elapsed < timeout_ms) {
+        uint32_t wait_ms = timeout_ms - elapsed;
+        if (wait_ms > 5U) wait_ms = 5U;
+        if (ctx->recv(&recv_id, recv_data, wait_ms, ctx->user_ctx) == 0 &&
+            damiao_is_register_write_ack(recv_data) && recv_data[3] == rid) {
+            return DAMIAO_ERR_OK;
+        }
+        elapsed += wait_ms;
     }
-
-    if (!damiao_is_register_write_ack(recv_data)) {
-        return DAMIAO_ERR_CAN_READ;
-    }
-
-    return DAMIAO_ERR_OK;
+    return DAMIAO_ERR_TIMEOUT;
 }
 
 /*===========================================================================
@@ -329,30 +326,12 @@ int damiao_write_register_u32(const DamiaoModeSwitchCtx *ctx, uint8_t rid,
  * @return DAMIAO_ERR_OK on success, negative on failure (non-fatal)
  */
 static int try_read_position(const DamiaoModeSwitchCtx *ctx, float *pos_out) {
-    uint8_t cmd[8];
-    uint16_t recv_id;
-    uint8_t recv_data[8];
-    DamiaoRegisterValue rv;
-
-    /* Send register read request for position (RID=80) */
-    damiao_encode_register_read_cmd(ctx->motor_id, DAMIAO_REG_MOTOR_POS, cmd);
-    if (ctx->send(damiao_get_register_can_id(), cmd, ctx->user_ctx) != 0) {
-        return DAMIAO_ERR_CAN_WRITE;
+    uint32_t raw;
+    int rc = damiao_read_register_u32(ctx, DAMIAO_REG_MOTOR_POS, &raw, 10U);
+    if (rc == DAMIAO_ERR_OK) {
+        memcpy(pos_out, &raw, sizeof(raw));
     }
-
-    /* Wait for reply with short timeout */
-    if (ctx->recv(&recv_id, recv_data, 10, ctx->user_ctx) != 0) {
-        return DAMIAO_ERR_TIMEOUT;
-    }
-
-    if (!damiao_is_register_reply(recv_data) ||
-        !damiao_decode_register_value(recv_data, &rv) ||
-        rv.rid != DAMIAO_REG_MOTOR_POS) {
-        return DAMIAO_ERR_CAN_READ;
-    }
-
-    *pos_out = damiao_decode_register_f32(rv.data);
-    return DAMIAO_ERR_OK;
+    return rc;
 }
 
 /**
@@ -555,7 +534,7 @@ static const DamiaoRegisterInfo DAMIAO_REGISTER_TABLE[] = {
     { 51, DAMIAO_DATA_FLOAT,  DAMIAO_ACCESS_RO },  /* v_off */
     { 52, DAMIAO_DATA_FLOAT,  DAMIAO_ACCESS_RO },  /* k1 */
     { 53, DAMIAO_DATA_FLOAT,  DAMIAO_ACCESS_RO },  /* k2 */
-    { 54, DAMIAO_DATA_FLOAT,  DAMIAO_ACCESS_RO },  /* m_off */
+    { 54, DAMIAO_DATA_FLOAT,  DAMIAO_ACCESS_RO },  /* x_off (output shaft) */
     { 55, DAMIAO_DATA_FLOAT,  DAMIAO_ACCESS_RO },  /* dir */
     { 56, DAMIAO_DATA_FLOAT,  DAMIAO_ACCESS_RO },  /* m_off (motor side) */
     { 59, DAMIAO_DATA_FLOAT,  DAMIAO_ACCESS_RO },  /* Imax */
@@ -616,28 +595,21 @@ static int write_register_u32_once_and_verify(const DamiaoModeSwitchCtx *ctx,
         return DAMIAO_ERR_CAN_WRITE;
     }
 
-    /* Wait for write ACK */
-    if (ctx->recv(&recv_id, recv_data, timeout_ms, ctx->user_ctx) != 0) {
-        return DAMIAO_ERR_TIMEOUT;
-    }
-
-    /* Validate it's a write-ACK frame */
-    if (!damiao_is_register_write_ack(recv_data)) {
-        return DAMIAO_ERR_CAN_READ;
-    }
-
-    /* Verify ACK data bytes match the written value */
-    {
-        uint32_t ack_value = (uint32_t)recv_data[4]
-                           | ((uint32_t)recv_data[5] << 8)
-                           | ((uint32_t)recv_data[6] << 16)
-                           | ((uint32_t)recv_data[7] << 24);
-        if (ack_value != value) {
-            return DAMIAO_ERR_CAN_READ; /* ACK value mismatch */
+    uint32_t elapsed = 0U;
+    while (elapsed < timeout_ms) {
+        uint32_t wait_ms = timeout_ms - elapsed;
+        if (wait_ms > 5U) wait_ms = 5U;
+        if (ctx->recv(&recv_id, recv_data, wait_ms, ctx->user_ctx) == 0 &&
+            damiao_is_register_write_ack(recv_data) && recv_data[3] == rid) {
+            uint32_t ack_value = (uint32_t)recv_data[4]
+                               | ((uint32_t)recv_data[5] << 8)
+                               | ((uint32_t)recv_data[6] << 16)
+                               | ((uint32_t)recv_data[7] << 24);
+            return (ack_value == value) ? DAMIAO_ERR_OK : DAMIAO_ERR_CAN_READ;
         }
+        elapsed += wait_ms;
     }
-
-    return DAMIAO_ERR_OK;
+    return DAMIAO_ERR_TIMEOUT;
 }
 
 int damiao_write_register_u32_retry(const DamiaoModeSwitchCtx *ctx, uint8_t rid,

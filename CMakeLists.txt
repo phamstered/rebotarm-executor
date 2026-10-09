@@ -28,6 +28,10 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS TRUE)
 project(${CMAKE_PROJECT_NAME})
 message("Build type: " ${CMAKE_BUILD_TYPE})
 
+# The STM32H7 OTG core can leave TXFFLSH asserted during a host bus reset.
+# Bound the HAL polling loop so one reset interrupt cannot block EP0 for ~16 s.
+add_compile_definitions(HAL_USB_TIMEOUT=100000U)
+
 # Enable CMake support for ASM and C languages
 enable_language(C ASM)
 

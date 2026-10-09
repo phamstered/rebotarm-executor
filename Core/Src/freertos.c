@@ -24,7 +24,7 @@
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
-// #include "vofa.h"  // 注释掉 vofa，USB CDC 供 micro-ROS 使用
+#include "vofa.h"
 #include "cmsis_os2.h"
 #include "bsp_fdcan.h"
 #include "damiao_protocol.h"
@@ -32,8 +32,10 @@
 
 // micro-ROS includes
 #include <stdbool.h>
+#include <math.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <string.h>
 #include <rcl/rcl.h>
 #include <rcl/error_handling.h>
 #include <rclc/rclc.h>
@@ -42,6 +44,8 @@
 #include <rmw_microxrcedds_c/config.h>
 #include <rmw_microros/rmw_microros.h>
 #include <std_msgs/msg/int32.h>
+#include <std_msgs/msg/u_int32.h>
+#include <std_msgs/msg/u_int32_multi_array.h>
 #include <sensor_msgs/msg/joint_state.h>
 #include <microros_stm32h723_bridge/msg/joint_command.h>
 #include <microros_stm32h723_bridge/msg/hardware_status.h>
@@ -86,6 +90,10 @@ extern void * microros_allocate(size_t size, void * state);
 extern void microros_deallocate(void * pointer, void * state);
 extern void * microros_reallocate(void * pointer, size_t size, void * state);
 extern void * microros_zero_allocate(size_t number_of_elements, size_t size_of_element, void * state);
+extern uint32_t microros_usb_rx_overflow_count(void);
+extern uint32_t microros_usb_write_timeout_count(void);
+extern uint32_t microros_usb_tx_overflow_count(void);
+extern uint32_t microros_usb_tx_high_water_mark(void);
 /* USER CODE END FunctionPrototypes */
 
 /* Private application code --------------------------------------------------*/
@@ -95,10 +103,11 @@ void StartMotorControlTask(void *argument)
 {
   (void)argument;
   TickType_t wake = xTaskGetTickCount();
+  fdcan1_register_rx_task(xTaskGetCurrentTaskHandle());
   motor_bridge_init();
   for (;;) {
     motor_bridge_control_step(HAL_GetTick());
-    vTaskDelayUntil(&wake, pdMS_TO_TICKS(2U));
+    vTaskDelayUntil(&wake, pdMS_TO_TICKS(MOTOR_BRIDGE_CONTROL_PERIOD_MS));
   }
 }
 
@@ -129,6 +138,319 @@ void StartSafetyTask(void *argument)
   *         CAN ID: 0x100, 8 bytes
   */
 extern FDCAN_HandleTypeDef hfdcan1;
+
+#define DAMIAO_TEST_MOTOR_ID          0x01U
+#define DAMIAO_TEST_KP                8.0f
+#define DAMIAO_TEST_KD                2.0f
+#define DAMIAO_TEST_ROTATION_RAD      6.283185307f
+#define DAMIAO_TEST_RAMP_RAD_S        0.5f
+#define DAMIAO_TEST_PERIOD_MS         20U
+#define DAMIAO_TEST_FEEDBACK_LIMIT_MS 100U
+
+static const DamiaoLimits damiao_test_limits = {
+  .p_min = -12.5f,
+  .p_max = 12.5f,
+  .v_min = -30.0f,
+  .v_max = 30.0f,
+  .t_min = -5.0f,
+  .t_max = 5.0f
+};
+
+static DamiaoMotorState damiao_test_motor;
+volatile float damiao_test_phase;
+volatile float damiao_test_target;
+volatile float damiao_test_vbus;
+volatile uint32_t damiao_test_status;
+
+static int damiao_test_can_send(uint16_t can_id, const uint8_t *data, void *ctx)
+{
+  (void)ctx;
+  return fdcanx_send_data(&hfdcan1, can_id, (uint8_t *)data, DAMIAO_DLC) == 0U
+      ? 0 : -1;
+}
+
+static int damiao_test_can_recv(uint16_t *can_id, uint8_t *data,
+                                uint32_t timeout_ms, void *ctx)
+{
+  (void)ctx;
+  uint32_t start = HAL_GetTick();
+  for (;;) {
+    if (fdcan1_get_rx_data(can_id, data) == DAMIAO_DLC) {
+      return 0;
+    }
+    uint32_t elapsed = HAL_GetTick() - start;
+    if (elapsed >= timeout_ms) {
+      return -1;
+    }
+    if (ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(timeout_ms - elapsed)) == 0U) {
+      return -1;
+    }
+  }
+}
+
+static void damiao_test_sleep(uint32_t ms, void *ctx)
+{
+  (void)ctx;
+  osDelay(ms);
+}
+
+static void damiao_test_telemetry(float phase, float target)
+{
+  damiao_test_phase = phase;
+  damiao_test_target = target;
+  damiao_test_status = damiao_test_motor.last_feedback.status_code;
+  vofa_send_data(0U, phase);
+  vofa_send_data(1U, target);
+  vofa_send_data(2U, damiao_test_motor.last_feedback.pos);
+  vofa_send_data(3U, damiao_test_motor.last_feedback.vel);
+  vofa_send_data(4U, damiao_test_motor.last_feedback.torq);
+  vofa_sendframetail();
+}
+
+static void damiao_test_disable_forever(float error_code)
+{
+  for (;;) {
+    (void)damiao_motor_disable(&damiao_test_motor, damiao_test_can_send, NULL);
+    damiao_test_telemetry(error_code, 0.0f);
+    osDelay(100U);
+  }
+}
+
+static bool damiao_test_feedback_safe(float target)
+{
+  const DamiaoFeedback *feedback = &damiao_test_motor.last_feedback;
+  return damiao_test_motor.has_feedback &&
+      isfinite(feedback->pos) && isfinite(feedback->vel) &&
+      isfinite(feedback->torq) &&
+      feedback->status_code == DAMIAO_STATUS_ENABLED &&
+      fabsf(feedback->pos) <= 7.0f &&
+      fabsf(feedback->pos - target) <= 0.50f &&
+      fabsf(feedback->vel) <= 1.50f && fabsf(feedback->torq) <= 1.0f;
+}
+
+static bool damiao_test_run_ramp(float phase, float from, float to)
+{
+  uint8_t command[DAMIAO_DLC];
+  uint32_t start = HAL_GetTick();
+  float distance = fabsf(to - from);
+  uint32_t duration_ms = (uint32_t)(distance / DAMIAO_TEST_RAMP_RAD_S * 1000.0f);
+
+  while ((uint32_t)(HAL_GetTick() - start) <= duration_ms) {
+    uint32_t cycle_start = HAL_GetTick();
+    float progress = duration_ms == 0U ? 1.0f :
+        (float)(cycle_start - start) / (float)duration_ms;
+    if (progress > 1.0f) progress = 1.0f;
+    float target = from + (to - from) * progress;
+    damiao_encode_mit_cmd(target, 0.0f, 0.0f, DAMIAO_TEST_KP, DAMIAO_TEST_KD,
+                          &damiao_test_limits, command);
+    if (damiao_test_can_send(DAMIAO_TEST_MOTOR_ID, command, NULL) != 0) {
+      return false;
+    }
+
+    bool received = false;
+    uint32_t feedback_start = HAL_GetTick();
+    while ((uint32_t)(HAL_GetTick() - feedback_start) < DAMIAO_TEST_FEEDBACK_LIMIT_MS) {
+      uint16_t can_id;
+      uint8_t data[DAMIAO_DLC];
+      if (damiao_test_can_recv(&can_id, data, 10U, NULL) == 0) {
+        damiao_motor_state_process_frame(&damiao_test_motor, can_id, data);
+        if (can_id == damiao_test_motor.feedback_id) {
+          received = true;
+          break;
+        }
+      }
+    }
+    if (!received || !damiao_test_feedback_safe(target)) {
+      return false;
+    }
+    damiao_test_telemetry(phase, target);
+
+    uint32_t elapsed = HAL_GetTick() - cycle_start;
+    if (elapsed < DAMIAO_TEST_PERIOD_MS) {
+      osDelay(DAMIAO_TEST_PERIOD_MS - elapsed);
+    }
+  }
+  return true;
+}
+
+static bool damiao_test_hold(float phase, float target, uint32_t duration_ms)
+{
+  uint8_t command[DAMIAO_DLC];
+  uint32_t start = HAL_GetTick();
+  damiao_encode_mit_cmd(target, 0.0f, 0.0f, DAMIAO_TEST_KP, DAMIAO_TEST_KD,
+                        &damiao_test_limits, command);
+  while ((uint32_t)(HAL_GetTick() - start) < duration_ms) {
+    if (damiao_test_can_send(DAMIAO_TEST_MOTOR_ID, command, NULL) != 0) {
+      return false;
+    }
+    bool received = false;
+    uint32_t feedback_start = HAL_GetTick();
+    while ((uint32_t)(HAL_GetTick() - feedback_start) <
+           DAMIAO_TEST_FEEDBACK_LIMIT_MS) {
+      uint16_t can_id;
+      uint8_t data[DAMIAO_DLC];
+      if (damiao_test_can_recv(&can_id, data, 10U, NULL) == 0) {
+        damiao_motor_state_process_frame(&damiao_test_motor, can_id, data);
+        if (can_id == damiao_test_motor.feedback_id) {
+          received = true;
+          break;
+        }
+      }
+    }
+    if (!received || !damiao_test_feedback_safe(target)) {
+      return false;
+    }
+    damiao_test_telemetry(phase, target);
+    osDelay(DAMIAO_TEST_PERIOD_MS);
+  }
+  return true;
+}
+
+static bool damiao_test_wait_status(uint8_t expected_status,
+                                    uint32_t timeout_ms)
+{
+  uint32_t start = HAL_GetTick();
+  while ((uint32_t)(HAL_GetTick() - start) < timeout_ms) {
+    uint16_t can_id;
+    uint8_t data[DAMIAO_DLC];
+    if (damiao_test_can_recv(&can_id, data, 10U, NULL) == 0 &&
+        can_id == damiao_test_motor.feedback_id) {
+      damiao_motor_state_process_frame(&damiao_test_motor, can_id, data);
+      if (damiao_test_motor.last_feedback.status_code == expected_status) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+void StartDamiaoMotorTask(void *argument)
+{
+  (void)argument;
+  uint8_t command[DAMIAO_DLC];
+  uint16_t can_id;
+  uint8_t data[DAMIAO_DLC];
+
+  fdcan1_register_rx_task(xTaskGetCurrentTaskHandle());
+  damiao_motor_state_init(&damiao_test_motor, DAMIAO_TEST_MOTOR_ID,
+                          DAMIAO_TEST_MOTOR_ID + 0x10U, &damiao_test_limits);
+  DamiaoModeSwitchCtx mode_ctx = {
+    .motor_id = DAMIAO_TEST_MOTOR_ID,
+    .send = damiao_test_can_send,
+    .recv = damiao_test_can_recv,
+    .sleep = damiao_test_sleep,
+    .user_ctx = NULL,
+    .limits = &damiao_test_limits
+  };
+
+  osDelay(1000U);
+  (void)damiao_motor_disable(&damiao_test_motor, damiao_test_can_send, NULL);
+  osDelay(50U);
+  while (fdcan1_get_rx_data(&can_id, data) == DAMIAO_DLC) { }
+
+  if (damiao_motor_request_feedback_state(&damiao_test_motor, &mode_ctx, 300U) !=
+          DAMIAO_ERR_OK ||
+      damiao_test_motor.last_feedback.status_code != DAMIAO_STATUS_DISABLED ||
+      !isfinite(damiao_test_motor.last_feedback.pos) ||
+      !isfinite(damiao_test_motor.last_feedback.vel) ||
+      !isfinite(damiao_test_motor.last_feedback.torq) ||
+      fabsf(damiao_test_motor.last_feedback.pos) > 12.5f ||
+      fabsf(damiao_test_motor.last_feedback.vel) > 0.20f ||
+      fabsf(damiao_test_motor.last_feedback.torq) > 1.0f) {
+    damiao_test_disable_forever(-11.0f);
+  }
+  if (damiao_ensure_control_mode(&mode_ctx, DAMIAO_MODE_MIT, 1000U) !=
+      DAMIAO_ERR_OK) {
+    damiao_test_disable_forever(-12.0f);
+  }
+
+  uint32_t vbus_raw = 0U;
+  if (damiao_read_register_u32(&mode_ctx, 60U, &vbus_raw, 300U) ==
+      DAMIAO_ERR_OK) {
+    memcpy((void *)&damiao_test_vbus, &vbus_raw, sizeof(vbus_raw));
+  } else {
+    damiao_test_vbus = -1.0f;
+  }
+
+  if (damiao_motor_disable(&damiao_test_motor, damiao_test_can_send, NULL) !=
+      DAMIAO_ERR_OK) {
+    damiao_test_disable_forever(-13.0f);
+  }
+  bool zeroed = false;
+  for (uint32_t attempt = 0U; attempt < 5U && !zeroed; attempt++) {
+    if (damiao_motor_set_zero_position(&damiao_test_motor,
+                                       damiao_test_can_send,
+                                       damiao_test_sleep, NULL) !=
+        DAMIAO_ERR_OK) {
+      break;
+    }
+    osDelay(50U);
+    if (damiao_motor_request_feedback_state(&damiao_test_motor, &mode_ctx,
+                                            300U) == DAMIAO_ERR_OK &&
+        damiao_test_motor.last_feedback.status_code == DAMIAO_STATUS_DISABLED &&
+        fabsf(damiao_test_motor.last_feedback.pos) <= 0.05f) {
+      zeroed = true;
+    }
+  }
+  if (!zeroed) {
+    damiao_test_disable_forever(-13.0f);
+  }
+  damiao_test_telemetry(1.0f, 0.0f);
+
+  damiao_encode_mit_cmd(0.0f, 0.0f, 0.0f, 0.0f, 0.0f,
+                        &damiao_test_limits, command);
+  if (damiao_test_can_send(DAMIAO_TEST_MOTOR_ID, command, NULL) != 0) {
+    damiao_test_disable_forever(-14.0f);
+  }
+  bool enabled = false;
+  for (uint32_t attempt = 0U; attempt < 5U && !enabled; attempt++) {
+    if (damiao_motor_enable(&damiao_test_motor, damiao_test_can_send, NULL) !=
+        DAMIAO_ERR_OK) {
+      break;
+    }
+    osDelay(50U);
+    if (damiao_motor_request_feedback_state(&damiao_test_motor, &mode_ctx,
+                                            300U) == DAMIAO_ERR_OK &&
+        damiao_test_motor.last_feedback.status_code == DAMIAO_STATUS_ENABLED) {
+      enabled = true;
+    }
+  }
+  if (!enabled) {
+    damiao_test_disable_forever(-15.0f);
+  }
+  damiao_test_telemetry(2.0f, 0.0f);
+
+  if (!damiao_test_hold(2.0f, 0.0f, 500U)) {
+    damiao_test_disable_forever(-16.0f);
+  }
+  if (!damiao_test_run_ramp(3.0f, 0.0f, DAMIAO_TEST_ROTATION_RAD)) {
+    damiao_test_disable_forever(-17.0f);
+  }
+  if (!damiao_test_hold(4.0f, DAMIAO_TEST_ROTATION_RAD, 500U)) {
+    damiao_test_disable_forever(-18.0f);
+  }
+  if (!damiao_test_run_ramp(5.0f, DAMIAO_TEST_ROTATION_RAD, 0.0f)) {
+    damiao_test_disable_forever(-19.0f);
+  }
+  if (!damiao_test_hold(6.0f, 0.0f, 2000U) ||
+      fabsf(damiao_test_motor.last_feedback.pos) > 0.05f) {
+    damiao_test_disable_forever(-20.0f);
+  }
+
+  bool disabled = false;
+  for (uint32_t attempt = 0U; attempt < 5U && !disabled; attempt++) {
+    while (fdcan1_get_rx_data(&can_id, data) == DAMIAO_DLC) { }
+    if (damiao_motor_disable(&damiao_test_motor, damiao_test_can_send, NULL) !=
+        DAMIAO_ERR_OK) {
+      break;
+    }
+    disabled = damiao_test_wait_status(DAMIAO_STATUS_DISABLED, 200U);
+  }
+  if (!disabled) {
+    damiao_test_disable_forever(-21.0f);
+  }
+  damiao_test_disable_forever(7.0f);
+}
 //
 // void StartCanDemoTask(void *argument)
 // {
@@ -371,9 +693,55 @@ extern FDCAN_HandleTypeDef hfdcan1;
 
 static rcl_publisher_t joint_state_publisher;
 static rcl_publisher_t status_publisher;
+static rcl_publisher_t zero_state_publisher;
+static rcl_publisher_t zero_status_publisher;
+static rcl_publisher_t microros_diagnostics_publisher;
 static sensor_msgs__msg__JointState joint_state_message;
+static sensor_msgs__msg__JointState zero_state_message;
 static microros_stm32h723_bridge__msg__HardwareStatus status_message;
 static microros_stm32h723_bridge__msg__JointCommand command_message;
+static std_msgs__msg__UInt32 zero_get_message;
+static std_msgs__msg__UInt32 zero_set_message;
+static std_msgs__msg__UInt32MultiArray zero_status_message;
+static std_msgs__msg__UInt32MultiArray microros_diagnostics_message;
+static uint32_t published_zero_sequence = UINT32_MAX;
+static uint32_t published_zero_signature = UINT32_MAX;
+static uint32_t last_zero_publish_ms;
+static uint32_t last_diagnostics_publish_ms;
+
+enum {
+  MICROROS_EXIT_NONE = 0U,
+  MICROROS_EXIT_SPIN_ERROR = 1U,
+  MICROROS_EXIT_PING_FAILURES = 2U,
+  MICROROS_EXIT_INIT_FAILURE = 3U
+};
+
+#define MICROROS_PING_PERIOD_MS 1000U
+#define MICROROS_PING_TIMEOUT_MS 20U
+#define MICROROS_FAILURE_LIMIT 3U
+#define MICROROS_DIAGNOSTICS_PERIOD_MS 1000U
+#define MICROROS_EXECUTOR_SPIN_TIMEOUT_MS 1U
+
+typedef struct {
+  uint32_t session_generation;
+  uint32_t last_exit_reason;
+  uint32_t last_spin_return_code;
+  uint32_t last_ping_return_code;
+  uint32_t consecutive_ping_failures;
+  uint32_t consecutive_spin_failures;
+  uint32_t spin_failure_count;
+  uint32_t ping_failure_count;
+  uint32_t publish_failure_count;
+  uint32_t joint_state_publish_count;
+  uint32_t last_joint_state_publish_ms;
+  uint32_t max_joint_state_publish_gap_ms;
+} MicrorosDiagnostics;
+
+static MicrorosDiagnostics microros_diagnostics;
+static const char *const joint_names[MOTOR_BRIDGE_JOINT_COUNT] = {
+  "joint1", "joint2", "joint3", "joint4", "joint5", "joint6",
+  "gripper_finger_left_joint"
+};
 
 static void joint_command_callback(const void *message)
 {
@@ -391,6 +759,20 @@ static void joint_command_callback(const void *message)
   (void)motor_bridge_accept_command(&command, HAL_GetTick());
 }
 
+static void zero_get_callback(const void *message)
+{
+  const std_msgs__msg__UInt32 *request = message;
+  (void)motor_bridge_request_zero_position(MOTOR_ZERO_OPERATION_GET,
+                                           request->data);
+}
+
+static void zero_set_callback(const void *message)
+{
+  const std_msgs__msg__UInt32 *request = message;
+  (void)motor_bridge_request_zero_position(MOTOR_ZERO_OPERATION_SET,
+                                           request->data);
+}
+
 static void publish_timer_callback(rcl_timer_t *timer, int64_t last_call_time)
 {
   (void)last_call_time;
@@ -399,10 +781,14 @@ static void publish_timer_callback(rcl_timer_t *timer, int64_t last_call_time)
   }
 
   MotorBridgeSnapshot snapshot;
+  MotorBridgeZeroSnapshot zero_snapshot;
   motor_bridge_get_snapshot(&snapshot);
-  joint_state_message.position.data[0] = snapshot.position;
-  joint_state_message.velocity.data[0] = snapshot.velocity;
-  joint_state_message.effort.data[0] = snapshot.effort;
+  motor_bridge_get_zero_snapshot(&zero_snapshot);
+  for (uint32_t i = 0U; i < MOTOR_BRIDGE_JOINT_COUNT; i++) {
+    joint_state_message.position.data[i] = snapshot.position[i];
+    joint_state_message.velocity.data[i] = snapshot.velocity[i];
+    joint_state_message.effort.data[i] = snapshot.effort[i];
+  }
   status_message.last_command_sequence = snapshot.last_command_sequence;
   status_message.mode = snapshot.mode;
   status_message.active_joint_mask = snapshot.active_joint_mask;
@@ -416,30 +802,144 @@ static void publish_timer_callback(rcl_timer_t *timer, int64_t last_call_time)
     joint_state_message.header.stamp.nanosec = nanosec;
     status_message.header.stamp.sec = sec;
     status_message.header.stamp.nanosec = nanosec;
+    zero_state_message.header.stamp.sec = sec;
+    zero_state_message.header.stamp.nanosec = nanosec;
   }
 
-  if (rcl_publish(&joint_state_publisher, &joint_state_message, NULL) != RCL_RET_OK ||
-      rcl_publish(&status_publisher, &status_message, NULL) != RCL_RET_OK) {
-    motor_bridge_force_disable(MOTOR_FAULT_NONE);
+  /* Publish failures do not override the local command watchdog. */
+  if (rcl_publish(&joint_state_publisher, &joint_state_message, NULL) !=
+      RCL_RET_OK) {
+    microros_diagnostics.publish_failure_count++;
+  } else {
+    uint32_t publish_ms = HAL_GetTick();
+    if (microros_diagnostics.last_joint_state_publish_ms != 0U) {
+      uint32_t gap_ms = publish_ms -
+        microros_diagnostics.last_joint_state_publish_ms;
+      if (gap_ms > microros_diagnostics.max_joint_state_publish_gap_ms) {
+        microros_diagnostics.max_joint_state_publish_gap_ms = gap_ms;
+      }
+    }
+    microros_diagnostics.last_joint_state_publish_ms = publish_ms;
+    microros_diagnostics.joint_state_publish_count++;
+  }
+  if (rcl_publish(&status_publisher, &status_message, NULL) !=
+      RCL_RET_OK) microros_diagnostics.publish_failure_count++;
+
+  uint32_t zero_signature = ((uint32_t)zero_snapshot.busy << 31) |
+      ((uint32_t)zero_snapshot.result_code << 24) |
+      (zero_snapshot.success_mask << 8) | zero_snapshot.failure_mask;
+  if (zero_snapshot.sequence != published_zero_sequence ||
+      zero_signature != published_zero_signature ||
+      (uint32_t)(HAL_GetTick() - last_zero_publish_ms) >= 500U) {
+    zero_status_message.data.data[0] = zero_snapshot.sequence;
+    zero_status_message.data.data[1] = zero_snapshot.operation;
+    zero_status_message.data.data[2] = zero_snapshot.requested_mask;
+    zero_status_message.data.data[3] = zero_snapshot.success_mask;
+    zero_status_message.data.data[4] = zero_snapshot.failure_mask;
+    zero_status_message.data.data[5] = zero_snapshot.result_code;
+    for (uint32_t i = 0U; i < MOTOR_BRIDGE_JOINT_COUNT; i++) {
+      zero_state_message.position.data[i] = zero_snapshot.output_offset[i];
+    }
+    if (rcl_publish(&zero_status_publisher, &zero_status_message, NULL) !=
+        RCL_RET_OK) {
+      microros_diagnostics.publish_failure_count++;
+      return;
+    }
+    if (!zero_snapshot.busy &&
+        rcl_publish(&zero_state_publisher, &zero_state_message, NULL) !=
+            RCL_RET_OK) {
+      microros_diagnostics.publish_failure_count++;
+      return;
+    }
+    published_zero_sequence = zero_snapshot.sequence;
+    published_zero_signature = zero_signature;
+    last_zero_publish_ms = HAL_GetTick();
+  }
+
+  if ((uint32_t)(HAL_GetTick() - last_diagnostics_publish_ms) >=
+      MICROROS_DIAGNOSTICS_PERIOD_MS) {
+    microros_diagnostics_message.data.data[0] = 1U;
+    microros_diagnostics_message.data.data[1] =
+      microros_diagnostics.session_generation;
+    microros_diagnostics_message.data.data[2] =
+      microros_diagnostics.last_exit_reason;
+    microros_diagnostics_message.data.data[3] =
+      microros_diagnostics.last_spin_return_code;
+    microros_diagnostics_message.data.data[4] =
+      microros_diagnostics.last_ping_return_code;
+    microros_diagnostics_message.data.data[5] =
+      microros_diagnostics.consecutive_ping_failures;
+    microros_diagnostics_message.data.data[6] =
+      microros_diagnostics.consecutive_spin_failures;
+    microros_diagnostics_message.data.data[7] =
+      microros_diagnostics.spin_failure_count;
+    microros_diagnostics_message.data.data[8] =
+      microros_diagnostics.ping_failure_count;
+    microros_diagnostics_message.data.data[9] =
+      microros_diagnostics.publish_failure_count;
+    microros_diagnostics_message.data.data[10] =
+      microros_usb_rx_overflow_count();
+    microros_diagnostics_message.data.data[11] =
+      microros_usb_write_timeout_count();
+    microros_diagnostics_message.data.data[12] =
+      microros_diagnostics.joint_state_publish_count;
+    microros_diagnostics_message.data.data[13] =
+      microros_diagnostics.max_joint_state_publish_gap_ms;
+    microros_diagnostics_message.data.data[14] =
+      microros_usb_tx_overflow_count();
+    microros_diagnostics_message.data.data[15] =
+      microros_usb_tx_high_water_mark();
+    if (rcl_publish(&microros_diagnostics_publisher,
+                    &microros_diagnostics_message, NULL) != RCL_RET_OK) {
+      microros_diagnostics.publish_failure_count++;
+    }
+    last_diagnostics_publish_ms = HAL_GetTick();
   }
 }
 
 static bool init_ros_messages(void)
 {
   if (!sensor_msgs__msg__JointState__init(&joint_state_message) ||
+      !sensor_msgs__msg__JointState__init(&zero_state_message) ||
       !microros_stm32h723_bridge__msg__HardwareStatus__init(&status_message) ||
-      !microros_stm32h723_bridge__msg__JointCommand__init(&command_message)) {
+      !microros_stm32h723_bridge__msg__JointCommand__init(&command_message) ||
+      !std_msgs__msg__UInt32__init(&zero_get_message) ||
+      !std_msgs__msg__UInt32__init(&zero_set_message) ||
+      !std_msgs__msg__UInt32MultiArray__init(&zero_status_message) ||
+      !std_msgs__msg__UInt32MultiArray__init(
+          &microros_diagnostics_message)) {
     return false;
   }
-  if (!rosidl_runtime_c__String__Sequence__init(&joint_state_message.name, 1U) ||
-      !rosidl_runtime_c__float64__Sequence__init(&joint_state_message.position, 1U) ||
-      !rosidl_runtime_c__float64__Sequence__init(&joint_state_message.velocity, 1U) ||
-      !rosidl_runtime_c__float64__Sequence__init(&joint_state_message.effort, 1U)) {
+  if (!rosidl_runtime_c__String__Sequence__init(
+          &joint_state_message.name, MOTOR_BRIDGE_JOINT_COUNT) ||
+      !rosidl_runtime_c__float64__Sequence__init(
+          &joint_state_message.position, MOTOR_BRIDGE_JOINT_COUNT) ||
+      !rosidl_runtime_c__float64__Sequence__init(
+          &joint_state_message.velocity, MOTOR_BRIDGE_JOINT_COUNT) ||
+      !rosidl_runtime_c__float64__Sequence__init(
+          &joint_state_message.effort, MOTOR_BRIDGE_JOINT_COUNT) ||
+      !rosidl_runtime_c__String__Sequence__init(
+          &zero_state_message.name, MOTOR_BRIDGE_JOINT_COUNT) ||
+      !rosidl_runtime_c__float64__Sequence__init(
+          &zero_state_message.position, MOTOR_BRIDGE_JOINT_COUNT) ||
+      !rosidl_runtime_c__uint32__Sequence__init(
+          &zero_status_message.data, 6U) ||
+      !rosidl_runtime_c__uint32__Sequence__init(
+          &microros_diagnostics_message.data, 16U)) {
     return false;
   }
-  return rosidl_runtime_c__String__assign(&joint_state_message.name.data[0], "joint1") &&
-         rosidl_runtime_c__String__assign(&joint_state_message.header.frame_id, "base_link") &&
-         rosidl_runtime_c__String__assign(&status_message.header.frame_id, "base_link");
+  for (uint32_t i = 0U; i < MOTOR_BRIDGE_JOINT_COUNT; i++) {
+    if (!rosidl_runtime_c__String__assign(
+            &joint_state_message.name.data[i], joint_names[i])) return false;
+    if (!rosidl_runtime_c__String__assign(
+            &zero_state_message.name.data[i], joint_names[i])) return false;
+  }
+  return rosidl_runtime_c__String__assign(
+           &joint_state_message.header.frame_id, "base_link") &&
+         rosidl_runtime_c__String__assign(
+           &status_message.header.frame_id, "base_link") &&
+         rosidl_runtime_c__String__assign(
+           &zero_state_message.header.frame_id, "motor_zero_offset");
 }
 
 void StartMicrorosTask(void *argument)
@@ -474,7 +974,6 @@ void StartMicrorosTask(void *argument)
   uint32_t reconnect_delay_ms = 250U;
   for (;;) {
     if (rmw_uros_ping_agent(100, 3) != RMW_RET_OK) {
-      motor_bridge_force_disable(MOTOR_FAULT_NONE);
       osDelay(reconnect_delay_ms);
       if (reconnect_delay_ms < 2000U) reconnect_delay_ms *= 2U;
       continue;
@@ -483,16 +982,28 @@ void StartMicrorosTask(void *argument)
     rclc_support_t support = {0};
     rcl_node_t node = rcl_get_zero_initialized_node();
     rcl_subscription_t subscription = rcl_get_zero_initialized_subscription();
+    rcl_subscription_t zero_get_subscription =
+      rcl_get_zero_initialized_subscription();
+    rcl_subscription_t zero_set_subscription =
+      rcl_get_zero_initialized_subscription();
     rcl_timer_t timer = rcl_get_zero_initialized_timer();
     rclc_executor_t executor = rclc_executor_get_zero_initialized_executor();
     joint_state_publisher = rcl_get_zero_initialized_publisher();
     status_publisher = rcl_get_zero_initialized_publisher();
+    zero_state_publisher = rcl_get_zero_initialized_publisher();
+    zero_status_publisher = rcl_get_zero_initialized_publisher();
+    microros_diagnostics_publisher = rcl_get_zero_initialized_publisher();
     bool initialized = false;
     bool support_ready = false;
     bool node_ready = false;
     bool subscription_ready = false;
+    bool zero_get_subscription_ready = false;
+    bool zero_set_subscription_ready = false;
     bool joint_publisher_ready = false;
     bool status_publisher_ready = false;
+    bool zero_state_publisher_ready = false;
+    bool zero_status_publisher_ready = false;
+    bool microros_diagnostics_publisher_ready = false;
     bool timer_ready = false;
     bool executor_ready = false;
 
@@ -506,6 +1017,14 @@ void StartMicrorosTask(void *argument)
           &subscription, &node,
           ROSIDL_GET_MSG_TYPE_SUPPORT(microros_stm32h723_bridge, msg, JointCommand),
           "/stm32/joint_commands") == RCL_RET_OK;
+      zero_get_subscription_ready = rclc_subscription_init_best_effort(
+          &zero_get_subscription, &node,
+          ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, UInt32),
+          "/stm32/zero_position/get") == RCL_RET_OK;
+      zero_set_subscription_ready = rclc_subscription_init_best_effort(
+          &zero_set_subscription, &node,
+          ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, UInt32),
+          "/stm32/zero_position/set") == RCL_RET_OK;
       joint_publisher_ready = rclc_publisher_init_best_effort(
           &joint_state_publisher, &node,
           ROSIDL_GET_MSG_TYPE_SUPPORT(sensor_msgs, msg, JointState),
@@ -514,33 +1033,95 @@ void StartMicrorosTask(void *argument)
           &status_publisher, &node,
           ROSIDL_GET_MSG_TYPE_SUPPORT(microros_stm32h723_bridge, msg, HardwareStatus),
           "/stm32/status") == RCL_RET_OK;
+      zero_state_publisher_ready = rclc_publisher_init_best_effort(
+          &zero_state_publisher, &node,
+          ROSIDL_GET_MSG_TYPE_SUPPORT(sensor_msgs, msg, JointState),
+          "/stm32/zero_position/state") == RCL_RET_OK;
+      zero_status_publisher_ready = rclc_publisher_init_best_effort(
+          &zero_status_publisher, &node,
+          ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, UInt32MultiArray),
+          "/stm32/zero_position/status") == RCL_RET_OK;
+      microros_diagnostics_publisher_ready = rclc_publisher_init_best_effort(
+          &microros_diagnostics_publisher, &node,
+          ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, UInt32MultiArray),
+          "/stm32/microros_diagnostics") == RCL_RET_OK;
       timer_ready = rclc_timer_init_default(
-        &timer, &support, RCL_MS_TO_NS(20U), publish_timer_callback) == RCL_RET_OK;
+        &timer, &support, RCL_MS_TO_NS(4U), publish_timer_callback) == RCL_RET_OK;
     }
-    if (subscription_ready && joint_publisher_ready && status_publisher_ready && timer_ready) {
+    if (subscription_ready && zero_get_subscription_ready &&
+        zero_set_subscription_ready && joint_publisher_ready &&
+        status_publisher_ready && zero_state_publisher_ready &&
+        zero_status_publisher_ready && microros_diagnostics_publisher_ready &&
+        timer_ready) {
       executor_ready = rclc_executor_init(
-        &executor, &support.context, 2U, &allocator) == RCL_RET_OK;
+        &executor, &support.context, 4U, &allocator) == RCL_RET_OK;
     }
     if (executor_ready &&
         rclc_executor_add_subscription(&executor, &subscription, &command_message,
                                        joint_command_callback, ON_NEW_DATA) == RCL_RET_OK &&
+        rclc_executor_add_subscription(&executor, &zero_get_subscription,
+                                       &zero_get_message, zero_get_callback,
+                                       ON_NEW_DATA) == RCL_RET_OK &&
+        rclc_executor_add_subscription(&executor, &zero_set_subscription,
+                                       &zero_set_message, zero_set_callback,
+                                       ON_NEW_DATA) == RCL_RET_OK &&
         rclc_executor_add_timer(&executor, &timer) == RCL_RET_OK) {
       initialized = true;
       reconnect_delay_ms = 250U;
+      published_zero_sequence = UINT32_MAX;
+      published_zero_signature = UINT32_MAX;
+      last_zero_publish_ms = 0U;
+      last_diagnostics_publish_ms = 0U;
+      microros_diagnostics.session_generation++;
+      microros_diagnostics.consecutive_ping_failures = 0U;
+      microros_diagnostics.consecutive_spin_failures = 0U;
       (void)rmw_uros_sync_session(1000);
     }
 
     uint32_t last_ping_ms = HAL_GetTick();
     while (initialized) {
-      if (rclc_executor_spin_some(&executor, RCL_MS_TO_NS(10U)) != RCL_RET_OK) break;
-      if ((uint32_t)(HAL_GetTick() - last_ping_ms) >= 1000U) {
+      rcl_ret_t spin_result =
+        rclc_executor_spin_some(
+          &executor, RCL_MS_TO_NS(MICROROS_EXECUTOR_SPIN_TIMEOUT_MS));
+      microros_diagnostics.last_spin_return_code = (uint32_t)spin_result;
+      if (spin_result == RCL_RET_OK || spin_result == RCL_RET_TIMEOUT) {
+        microros_diagnostics.consecutive_spin_failures = 0U;
+      } else {
+        microros_diagnostics.spin_failure_count++;
+        microros_diagnostics.consecutive_spin_failures++;
+        if (microros_diagnostics.consecutive_spin_failures >=
+            MICROROS_FAILURE_LIMIT) {
+          microros_diagnostics.last_exit_reason =
+            MICROROS_EXIT_SPIN_ERROR;
+          break;
+        }
+      }
+      if ((uint32_t)(HAL_GetTick() - last_ping_ms) >=
+          MICROROS_PING_PERIOD_MS) {
         last_ping_ms = HAL_GetTick();
-        if (rmw_uros_ping_agent(100, 1) != RMW_RET_OK) break;
+        rmw_ret_t ping_result =
+          rmw_uros_ping_agent(MICROROS_PING_TIMEOUT_MS, 1U);
+        microros_diagnostics.last_ping_return_code = (uint32_t)ping_result;
+        if (ping_result == RMW_RET_OK) {
+          microros_diagnostics.consecutive_ping_failures = 0U;
+        } else {
+          microros_diagnostics.ping_failure_count++;
+          microros_diagnostics.consecutive_ping_failures++;
+          if (microros_diagnostics.consecutive_ping_failures >=
+              MICROROS_FAILURE_LIMIT) {
+            microros_diagnostics.last_exit_reason =
+              MICROROS_EXIT_PING_FAILURES;
+            break;
+          }
+        }
       }
       osDelay(1U);
     }
 
-    motor_bridge_force_disable(MOTOR_FAULT_NONE);
+    if (!initialized) {
+      microros_diagnostics.last_exit_reason = MICROROS_EXIT_INIT_FAILURE;
+    }
+
     rcl_ret_t fini_result = RCL_RET_OK;
     if (support_ready) {
       rmw_context_t *rmw_context = rcl_context_get_rmw_context(&support.context);
@@ -551,6 +1132,11 @@ void StartMicrorosTask(void *argument)
     if (executor_ready) fini_result = rclc_executor_fini(&executor);
     if (timer_ready) fini_result = rcl_timer_fini(&timer);
     if (subscription_ready) fini_result = rcl_subscription_fini(&subscription, &node);
+    if (zero_set_subscription_ready) fini_result = rcl_subscription_fini(&zero_set_subscription, &node);
+    if (zero_get_subscription_ready) fini_result = rcl_subscription_fini(&zero_get_subscription, &node);
+    if (microros_diagnostics_publisher_ready) fini_result = rcl_publisher_fini(&microros_diagnostics_publisher, &node);
+    if (zero_status_publisher_ready) fini_result = rcl_publisher_fini(&zero_status_publisher, &node);
+    if (zero_state_publisher_ready) fini_result = rcl_publisher_fini(&zero_state_publisher, &node);
     if (status_publisher_ready) fini_result = rcl_publisher_fini(&status_publisher, &node);
     if (joint_publisher_ready) fini_result = rcl_publisher_fini(&joint_state_publisher, &node);
     if (node_ready) fini_result = rcl_node_fini(&node);

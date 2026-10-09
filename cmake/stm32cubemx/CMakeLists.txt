@@ -114,10 +114,10 @@ set(USB_Device_Lib_Src
     ${CMAKE_CURRENT_SOURCE_DIR}/../../Middlewares/ST/STM32_USB_Device_Library/Class/CDC/Src/usbd_cdc.c
 )
 
-# vofa+ sources (已禁用，USB CDC 供 micro-ROS 使用)
-# set(VOFA_Src
-#     ${CMAKE_CURRENT_SOURCE_DIR}/../../vofa+/vofa.c
-# )
+# vofa+ sources. Runtime task selection prevents sharing USB CDC with micro-ROS.
+set(VOFA_Src
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../vofa+/vofa.c
+)
 
 # micro-ROS sources
 set(MICROROS_Src
@@ -138,7 +138,7 @@ set(MX_LINK_LIBS
     FreeRTOS
     USB_Device_Lib
     USB_Device_App
-    # VOFA  # 已禁用，USB CDC 供 micro-ROS 使用
+    VOFA
     MICROROS
     ${CMAKE_CURRENT_SOURCE_DIR}/../../micro_ros_stm32cubemx_utils/microros_static_library/libmicroros/libmicroros.a
 )
@@ -168,10 +168,10 @@ add_library(USB_Device_App OBJECT)
 target_sources(USB_Device_App PRIVATE ${USB_DEVICE_App_Src} ${USB_DEVICE_Target_Src})
 target_link_libraries(USB_Device_App PUBLIC stm32cubemx)
 
-# Create VOFA library (已禁用，USB CDC 供 micro-ROS 使用)
-# add_library(VOFA OBJECT)
-# target_sources(VOFA PRIVATE ${VOFA_Src})
-# target_link_libraries(VOFA PUBLIC stm32cubemx)
+# Create VOFA library
+add_library(VOFA OBJECT)
+target_sources(VOFA PRIVATE ${VOFA_Src})
+target_link_libraries(VOFA PUBLIC stm32cubemx)
 
 # Create MICROROS library
 add_library(MICROROS OBJECT)
