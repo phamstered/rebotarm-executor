@@ -241,6 +241,16 @@ SECTIONS
     . = ALIGN(8);
   } >DTCMRAM
 
+  /* Large non-DMA USB transport queues. They are initialized by the transport
+     after reset and kept out of the nearly-full DTCM region. */
+  .usb_transport (NOLOAD) :
+  {
+    . = ALIGN(32);
+    *(.usb_transport)
+    *(.usb_transport*)
+    . = ALIGN(32);
+  } >RAM_D2
+
 
 
   /* Remove information from the standard libraries */

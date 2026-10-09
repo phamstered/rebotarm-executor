@@ -534,7 +534,7 @@ static const DamiaoRegisterInfo DAMIAO_REGISTER_TABLE[] = {
     { 51, DAMIAO_DATA_FLOAT,  DAMIAO_ACCESS_RO },  /* v_off */
     { 52, DAMIAO_DATA_FLOAT,  DAMIAO_ACCESS_RO },  /* k1 */
     { 53, DAMIAO_DATA_FLOAT,  DAMIAO_ACCESS_RO },  /* k2 */
-    { 54, DAMIAO_DATA_FLOAT,  DAMIAO_ACCESS_RO },  /* m_off */
+    { 54, DAMIAO_DATA_FLOAT,  DAMIAO_ACCESS_RO },  /* x_off (output shaft) */
     { 55, DAMIAO_DATA_FLOAT,  DAMIAO_ACCESS_RO },  /* dir */
     { 56, DAMIAO_DATA_FLOAT,  DAMIAO_ACCESS_RO },  /* m_off (motor side) */
     { 59, DAMIAO_DATA_FLOAT,  DAMIAO_ACCESS_RO },  /* Imax */

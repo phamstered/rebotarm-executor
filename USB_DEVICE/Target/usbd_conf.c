@@ -26,6 +26,7 @@
 #include "usbd_cdc.h"
 
 /* USER CODE BEGIN Includes */
+#include "FreeRTOSConfig.h"
 
 /* USER CODE END Includes */
 
@@ -92,6 +93,19 @@ void HAL_PCD_MspInit(PCD_HandleTypeDef* pcdHandle)
     HAL_NVIC_SetPriority(OTG_HS_IRQn, 0, 0);
     HAL_NVIC_EnableIRQ(OTG_HS_IRQn);
   /* USER CODE BEGIN USB_OTG_HS_MspInit 1 */
+
+    /* The CDC completion callback wakes a FreeRTOS task, so this IRQ must not
+     * run above configLIBRARY_MAX_SYSCALL_INTERRUPT_PRIORITY. */
+    HAL_NVIC_SetPriority(OTG_HS_IRQn,
+                        configLIBRARY_MAX_SYSCALL_INTERRUPT_PRIORITY, 0U);
+
+    /* AIRCR software reset does not reliably clear the OTG HS core/FIFOs.
+     * Reset the peripheral explicitly so USB enumeration also recovers after
+     * ST-Link flashing or an in-field MCU restart while VBUS remains present. */
+    __HAL_RCC_USB1_OTG_HS_FORCE_RESET();
+    __DSB();
+    __HAL_RCC_USB1_OTG_HS_RELEASE_RESET();
+    __DSB();
 
   /* USER CODE END USB_OTG_HS_MspInit 1 */
   }
