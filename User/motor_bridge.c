@@ -23,7 +23,7 @@
 /* Conservative bring-up limits for gains and feed-forward effort. */
 #define COMMAND_KP_LIMIT 40.0f
 #define COMMAND_KD_LIMIT 5.0f
-#define COMMAND_EFFORT_LIMIT_NM 6.0f
+#define COMMAND_EFFORT_LIMIT_NM 10.0f
 
 extern FDCAN_HandleTypeDef hfdcan1;
 
