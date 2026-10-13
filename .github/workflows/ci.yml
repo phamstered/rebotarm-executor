@@ -1,0 +1,92 @@
+# rebotarm-executor CI — runs what GitHub-hosted runners can exercise.
+# Style modeled on phamstered/robot-debug-desk and phamstered/rebotarm-ros2-stack
+# (explicit covered/not-covered header, ubuntu-22.04, push/PR → main).
+#
+# Covered:
+#   - Debug cross-compile of rebotarm_executor.elf with arm-none-eabi-gcc + Ninja
+#   - Recursive submodule checkout (micro_ros_stm32cubemx_utils)
+#   - libmicroros.a generation via microros/micro_ros_static_library_builder:humble
+#     when the Actions cache misses (headers + static lib under
+#     microros_static_library/libmicroros/; gitignored / not in submodule)
+#
+# NOT covered here:
+#   - flash / ST-Link / OpenOCD
+#   - hardware bring-up
+#   - micro-ROS agent / live XRCE session
+#   - Release build (Debug only for this workflow)
+name: CI
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+    branches: ["main"]
+
+jobs:
+  build:
+    name: STM32 Debug firmware build
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install ARM GCC toolchain + CMake + Ninja
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y gcc-arm-none-eabi cmake ninja-build
+
+      - name: Verify toolchain
+        run: arm-none-eabi-gcc --version
+
+      # libmicroros.a is produced by the official micro-ROS static-library
+      # builder and is gitignored in the submodule. Cache by generation inputs
+      # so cold CI pays once; warm runs skip Docker rebuild.
+      - name: Cache libmicroros
+        id: cache-libmicroros
+        uses: actions/cache@v4
+        with:
+          path: micro_ros_stm32cubemx_utils/microros_static_library/libmicroros
+          key: libmicroros-${{ runner.os }}-${{ hashFiles('micro_ros_stm32cubemx_utils/microros_static_library/library_generation/**', 'Makefile') }}
+          restore-keys: |
+            libmicroros-${{ runner.os }}-
+
+      - name: Generate libmicroros.a (cache miss)
+        if: steps.cache-libmicroros.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          docker pull microros/micro_ros_static_library_builder:humble
+          # library_generation.sh prompts to confirm CFLAGS from `make print_cflags`.
+          printf 'y\n' | docker run -i --rm -v "$PWD":/project \
+            --env MICROROS_LIBRARY_FOLDER=micro_ros_stm32cubemx_utils/microros_static_library \
+            microros/micro_ros_static_library_builder:humble
+          test -f micro_ros_stm32cubemx_utils/microros_static_library/libmicroros/libmicroros.a
+
+      - name: Confirm libmicroros.a present
+        run: test -f micro_ros_stm32cubemx_utils/microros_static_library/libmicroros/libmicroros.a
+
+      - name: Configure (Debug)
+        run: cmake --preset Debug
+
+      - name: Build (Debug)
+        run: cmake --build build/Debug
+
+      - name: Confirm artifact
+        run: test -f build/Debug/rebotarm_executor.elf
+
+      - name: Firmware size
+        run: arm-none-eabi-size build/Debug/rebotarm_executor.elf
+
+      - name: Upload CMake / build logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cmake-debug-logs
+          path: |
+            build/Debug/CMakeFiles/CMakeError.log
+            build/Debug/CMakeFiles/CMakeOutput.log
+            build/Debug/**/*.log
+          if-no-files-found: ignore
