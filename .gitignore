@@ -38,3 +38,8 @@ micro_ros_stm32cubemx_utils/microros_static_library/library_generation/*
 micro_ros_stm32cubemx_utils/microros_static_library/library_generation/extra_packages/*
 !micro_ros_stm32cubemx_utils/microros_static_library/library_generation/extra_packages/microros_stm32h723_bridge/
 !micro_ros_stm32cubemx_utils/microros_static_library/library_generation/extra_packages/microros_stm32h723_bridge/**
+
+# VitePress / npm (docs only)
+node_modules/
+docs/.vitepress/dist/
+docs/.vitepress/cache/
