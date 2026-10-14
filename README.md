@@ -10,7 +10,14 @@
 | **栈** | FreeRTOS · micro-ROS · CMake / Ninja · `arm-none-eabi-gcc` |
 | **ROS 节点** | `/stm32h723_motor_bridge` |
 | **用户文档** | [https://phamstered.github.io/rebotarm-executor/](https://phamstered.github.io/rebotarm-executor/)（GitHub Pages） |
-| **相关仓库** | [`rebotarm-ros2-stack`](https://github.com/phamstered/rebotarm-ros2-stack)（上位机 ROS 2）· [`robot-debug-desk`](https://github.com/phamstered/robot-debug-desk)（桌面调试控制台） |
+
+## 相关仓库 / 职责
+
+| 仓库 | 职责 | 文档 |
+|---|---|---|
+| [`phamstered/robot-debug-desk`](https://github.com/phamstered/robot-debug-desk) | 上位机软件（Tauri / React 调试台） | [Pages](https://phamstered.github.io/robot-debug-desk/) |
+| [`phamstered/rebotarm-ros2-stack`](https://github.com/phamstered/rebotarm-ros2-stack) | ROS 2 控制栈（controller / MoveIt / 仿真） | [Pages](https://phamstered.github.io/rebotarm-ros2-stack/) |
+| [`phamstered/rebotarm-executor`](https://github.com/phamstered/rebotarm-executor) | FreeRTOS + micro-ROS 固件（本仓） | [Pages](https://phamstered.github.io/rebotarm-executor/) |
 
 ## 架构一览
 
