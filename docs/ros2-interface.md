@@ -113,17 +113,109 @@ uint32 active_joint_mask
 uint16 fault_code
 ```
 
-当前 `active_joint_mask=0x7F`。故障码如下：
+当前 `active_joint_mask=0x7F`。故障码为 **uint16 枚举（十进制序号）**，不是位标志；**数值以下表为准，不得静默改号**。符号名与
+`User/motor_bridge.h` 中 `MotorBridgeFault` 一致；与
+[rebotarm-ros2-stack 重力辨识草案](https://phamstered.github.io/rebotarm-ros2-stack/gravity-identification)
+§4.4 名称的别名映射见下文「重力辨识会话」。
 
-| 值 | 含义 | 值 | 含义 |
-|---|---|---|---|
-| 0 | 无故障 | 1 | 无效模式 |
-| 2 | NaN/Inf 命令 | 3 | kp/kd/effort 超限 |
-| 4 | sequence 过期 | 5 | 非活动关节命令（保留） |
-| 6 | 反馈超时/无效 | 7 | 电机驱动故障 |
-| 8 | CAN 发送失败 | 9 | 初始化失败 |
-| 10 | 电机使能超时 | 11 | 命令丢失已锁存 |
-| 12 | 零点维护忙 |  |  |
+| 值 | 符号名 | 含义 |
+|---:|---|---|
+| 0 | `MOTOR_FAULT_NONE` | 无故障 |
+| 1 | `MOTOR_FAULT_INVALID_MODE` | 无效模式 |
+| 2 | `MOTOR_FAULT_NONFINITE_COMMAND` | NaN/Inf 命令 |
+| 3 | `MOTOR_FAULT_COMMAND_LIMIT` | kp/kd/effort 超限 |
+| 4 | `MOTOR_FAULT_STALE_SEQUENCE` | sequence 过期 |
+| 5 | `MOTOR_FAULT_INACTIVE_JOINT_COMMAND` | 非活动关节命令（保留） |
+| 6 | `MOTOR_FAULT_FEEDBACK_TIMEOUT` | 反馈超时/无效 |
+| 7 | `MOTOR_FAULT_DRIVE` | 电机驱动故障 |
+| 8 | `MOTOR_FAULT_CAN_TX` | CAN 发送失败 |
+| 9 | `MOTOR_FAULT_INIT` | 初始化失败 |
+| 10 | `MOTOR_FAULT_ENABLE_TIMEOUT` | 电机使能超时 |
+| 11 | `MOTOR_FAULT_COMMAND_LOSS_LATCHED` | 命令丢失已锁存 |
+| 12 | `MOTOR_FAULT_ZERO_POSITION_BUSY` | 零点维护忙 |
+
+## 重力辨识会话
+
+上位编排（`rebotarm-ros2-stack` 的 `/StartGravityID`）在固件侧 **不** 增加 GravityID 模式位或专用消息。
+辨识会话 = 一串合法的 **HOLD / TRACK** `JointCommand` + 照常发布的 `JointState` /
+`HardwareStatus` 测量。算法、姿态规划与 YAML 写入均在 ROS，不在 MCU。
+
+设计源（草案）：仓库路径 `docs/gravity-identification.md`
+（[PR #12 头分支](https://github.com/phamstered/rebotarm-ros2-stack/blob/docs/gravity-identification-design/docs/gravity-identification.md)；
+合并后见 `main`）；站点页
+[gravity-identification](https://phamstered.github.io/rebotarm-ros2-stack/gravity-identification)
+（合并并部署后可用）。固件契约以本文 + 当前实现为准；草案 §2.5 / §4 提供会话语义与命名。
+
+### 会话命令流（§2.5）
+
+| 阶段 | 固件期望 | 说明 |
+|---|---|---|
+| 静置 / 采样 | `mode = HOLD (0)` | 首次进入 HOLD 时锁存实测位置；发送 **速度 0、力矩 0**，沿用命令的 kp/kd（见上文 HOLD 行为） |
+| 换姿激励 | 短暂 `mode = TRACK (1)` | 到位后 host 立即回到 HOLD |
+| 测量 | 无额外 API | 持续读 `/stm32/joint_states` 与 `/stm32/status` |
+| Abort / cancel | host 下发 HOLD | **不**自动 DISABLE；DISABLE 仅走现有 `mode=3` / `safe_stop` / 反馈超时等路径 |
+
+Host 必须在会话内按桥接频率 **持续发送** `JointCommand`（与正常 HOLD/TRACK 相同），不得停发。
+固件 **不**接受 Goal 里的 `command_timeout_ms` 运行时改写；超时为编译期常量（见下）。
+
+> **与草案对齐说明（HOLD + effort）**：ros2-stack 草案 §2.5 写「HOLD 时 `effort[]` = 重力前馈」。
+> **当前固件 HOLD 将 MIT 力矩通道置 0**（仅用锁存位置 + kp/kd）。需要前馈力矩时，host 应在
+> 到位后用 **TRACK、velocity≈0、effort=前馈** 保持，或等待后续 HOLD-with-effort 语义变更并同步 bump 本文。
+> 辨识采样本身只依赖 `JointState.effort` 反馈，不要求固件新增字段。
+
+### 命令超时与命令丢失路径（§4.3）
+
+与上文 JointCommand 安全策略一致；辨识会话 **依赖同一路径**，建议 host 侧把会话
+`command_timeout_ms` 期望对齐到约 **100 ms**（与 TRACK→HOLD 及桥 `state_timeout_ms: 100` 同量级）。
+
+| 常量（固件） | 值 | 行为 |
+|---|---:|---|
+| `COMMAND_TIMEOUT_MS` | 100 | 处于 TRACK 且距上一帧合法命令超过此时长 → **进入 HOLD**（不置故障码） |
+| `COMMAND_LOSS_LATCH_MS` | 500 | 非 DISABLE 且距上一帧合法命令超过此时长 → 锁存 `fault_code = 11`，若电机已使能则 **HOLD**，否则 DISABLE；之后拒绝新命令，需安全回零并重启恢复 |
+
+命令丢失后的固件行为摘要：
+
+1. 锁存 `MOTOR_FAULT_COMMAND_LOSS_LATCHED`（11）
+2. 关节进入 **HOLD**（保持最后锁存/安全位置；HOLD 下 effort=0）——**不是**会话 abort 时的首选 DISABLE
+3. `HardwareStatus.mode` 反映 HOLD（或未使能时的 DISABLE）
+4. Host 读到 fault 11 → action ABORTING → 若链路仍通可继续发 HOLD；否则引导现有 `safe_stop`
+
+反馈超时（fault 6）等路径仍可强制 DISABLE；那是硬件保护，与「辨识 abort → HOLD」的 host 契约分开。
+
+### 故障码别名（草案 §4.4 ↔ 现网表）
+
+草案曾建议十六进制位标志（如 `0x0001 = FAULT_CMD_LOSS`）。**现网固件使用上表十进制枚举，本文不改号。**
+ROS Feedback/Result 应 **原样透传** `HardwareStatus.fault_code`。名称对齐如下：
+
+| 草案名（§4.4） | 现网值 | 现网符号 | 会话内建议动作 | 备注 |
+|---|---:|---|---|---|
+| `FAULT_NONE` | 0 | `MOTOR_FAULT_NONE` | 继续 | 一致 |
+| `FAULT_CMD_LOSS` | **11** | `MOTOR_FAULT_COMMAND_LOSS_LATCHED` | abort → HOLD | 草案建议值 `0x0001` **未采用** |
+| `FAULT_STALE_SEQUENCE` | **4** | `MOTOR_FAULT_STALE_SEQUENCE` | abort；按现网清序列/重启策略 | 草案建议值 `0x0002` **未采用** |
+| `FAULT_MOTOR` | **7** | `MOTOR_FAULT_DRIVE` | abort → HOLD；禁止继续激励 | 草案建议值 `0x0004` **未采用**；驱动故障现网常伴随 DISABLE |
+| `FAULT_EFFORT_LIMIT` | **3**（近义） | `MOTOR_FAULT_COMMAND_LIMIT` | abort → HOLD | 现网为 **收命令时** kp/kd/\|effort\| 超限拒绝，非运行中力矩限幅专用码 |
+| `FAULT_VELOCITY_LIMIT` | — | （无固件码） | abort → HOLD | **ROS 侧**（或未来扩展）；勿占用现网 0–12 |
+| `FAULT_POSITION_DEVIATION` | — | （无固件码） | 姿态作废或整次 abort | **ROS 侧** |
+| `FAULT_GRIPPER_UNLOCKED` | — | （无固件码） | abort（若要求 lock_gripper） | **ROS 侧** |
+| `FAULT_SESSION_REJECTED` | — | （无固件码） | 不进入 ARMED | 可选；现网无「拒绝过宽 timeout」码（timeout 不可运行时配置） |
+
+ROS 自检故障可用高位（例如 `0x8000 | local_code`）并在 `message` 说明，避免与固件 0–12 冲突。
+
+现网另有、草案未单列的码（1、2、5、6、8、9、10、12）语义不变；会话中出现时同样应停止激励并按上表/安全策略处理。
+
+### 采样用反馈字段（§4.5）
+
+| 来源 | 字段 | 用途 |
+|---|---|---|
+| `sensor_msgs/JointState` | `position[i]` | 姿态 / HOLD 参考 |
+| `sensor_msgs/JointState` | `velocity[i]` | settle / capture 门槛 |
+| `sensor_msgs/JointState` | `effort[i]` | 测得力矩 τ_meas |
+| `HardwareStatus` | `mode` | 确认 HOLD/TRACK |
+| `HardwareStatus` | `last_command_sequence` | 链路健康 |
+| `HardwareStatus` | `active_joint_mask` | 与 Goal.joint_mask 交叉检查 |
+| `HardwareStatus` | `fault_code` | 见上表 |
+
+不要求新增辨识专用 msg；字段稳定性要求见下文「修改与兼容性要求」。
 
 ## 零点维护接口
 
