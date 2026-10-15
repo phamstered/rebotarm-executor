@@ -52,4 +52,4 @@ FDCAN 与 USB 细节见 [FDCAN 集成](./fdcan-integration)、[Vofa+ USB CDC](./
 
 - 权威接口：[`docs/ros2-interface.md`](./ros2-interface)（本站同页）。
 - Session / USB 稳定性验收：[micro-ROS Session 稳定性](./microros-session-stability)。
-- 桌面调试控制台见姊妹项目 [`robot-debug-desk`](https://github.com/phamstered/robot-debug-desk)（经 Jetson Bridge / Agent，不在本固件仓库内）。
+- 桌面调试控制台见姊妹项目 [`rebotarm-debug-desk`](https://github.com/phamstered/rebotarm-debug-desk)（经 Jetson Bridge / Agent，不在本固件仓库内）。

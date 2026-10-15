@@ -15,7 +15,7 @@
 
 | 仓库 | 职责 | 文档 |
 |---|---|---|
-| [`phamstered/robot-debug-desk`](https://github.com/phamstered/robot-debug-desk) | 上位机软件（Tauri / React 调试台） | [Pages](https://phamstered.github.io/robot-debug-desk/) |
+| [`phamstered/rebotarm-debug-desk`](https://github.com/phamstered/rebotarm-debug-desk) | 上位机软件（Tauri / React 调试台） | [Pages](https://phamstered.github.io/rebotarm-debug-desk/) |
 | [`phamstered/rebotarm-ros2-stack`](https://github.com/phamstered/rebotarm-ros2-stack) | ROS 2 控制栈（controller / MoveIt / 仿真） | [Pages](https://phamstered.github.io/rebotarm-ros2-stack/) |
 | [`phamstered/rebotarm-executor`](https://github.com/phamstered/rebotarm-executor) | FreeRTOS + micro-ROS 固件（本仓） | [Pages](https://phamstered.github.io/rebotarm-executor/) |
 
