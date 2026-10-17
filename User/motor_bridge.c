@@ -20,9 +20,7 @@
 #define ZERO_MAX_EFFORT_NM 0.50f
 #define ZERO_VERIFY_POSITION_RAD 0.05f
 
-/* Conservative bring-up limits for gains and feed-forward effort. */
-#define COMMAND_KP_LIMIT 40.0f
-#define COMMAND_KD_LIMIT 5.0f
+/* Feed-forward effort retains an independent application-level safety limit. */
 #define COMMAND_EFFORT_LIMIT_NM 10.0f
 
 extern FDCAN_HandleTypeDef hfdcan1;
@@ -120,8 +118,7 @@ static uint16_t validate_command(const MotorBridgeCommand *command)
         }
     }
     for (uint32_t i = 0U; i < MOTOR_BRIDGE_JOINT_COUNT; i++) {
-        if (command->kp[i] < 0.0f || command->kp[i] > COMMAND_KP_LIMIT ||
-            command->kd[i] < 0.0f || command->kd[i] > COMMAND_KD_LIMIT ||
+        if (command->kp[i] < 0.0f || command->kd[i] < 0.0f ||
             fabsf(command->effort[i]) > COMMAND_EFFORT_LIMIT_NM) {
             return MOTOR_FAULT_COMMAND_LIMIT;
         }

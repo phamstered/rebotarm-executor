@@ -48,8 +48,10 @@ float32[7] effort
 - `header` 当前不参与固件校验；安全超时使用 STM32 单调时钟。
 - `sequence` 必须按 uint32 回绕规则严格递增，重复或旧序号被拒绝。
 - `position` 单位 rad，`velocity` 单位 rad/s，`effort` 单位 Nm；数组按本文关节顺序排列。
-- 所有数值必须有限；`0 <= kp <= 40`、`0 <= kd <= 5`、`|effort| <= 10 Nm`。
-  这里的 effort 限制是独立的应用层安全策略，不是 MIT 报文的归一化量程。
+- 所有数值必须有限；应用层要求 `kp >= 0`、`kd >= 0`、`|effort| <= 10 Nm`，
+  不再为 kp/kd 设置额外的上限。这里的 effort 限制是独立的应用层安全策略。
+- 电机 MIT 协议本身的增益量程仍为 `0 <= kp <= 500`、`0 <= kd <= 5`。
+  超出协议量程的增益在报文编码时会钳制；例如命令 `kd=6` 实际编码为 `kd=5`。
 - JointCommand 层不限制 position/velocity；超出对应电机 MIT 编码范围的值会在
   序列化时钳制。命令编码和反馈解码均使用以下型号量程：
 
@@ -123,7 +125,7 @@ uint16 fault_code
 | 0 | `MOTOR_FAULT_NONE` | 无故障 |
 | 1 | `MOTOR_FAULT_INVALID_MODE` | 无效模式 |
 | 2 | `MOTOR_FAULT_NONFINITE_COMMAND` | NaN/Inf 命令 |
-| 3 | `MOTOR_FAULT_COMMAND_LIMIT` | kp/kd/effort 超限 |
+| 3 | `MOTOR_FAULT_COMMAND_LIMIT` | kp/kd 为负或 effort 超限 |
 | 4 | `MOTOR_FAULT_STALE_SEQUENCE` | sequence 过期 |
 | 5 | `MOTOR_FAULT_INACTIVE_JOINT_COMMAND` | 非活动关节命令（保留） |
 | 6 | `MOTOR_FAULT_FEEDBACK_TIMEOUT` | 反馈超时/无效 |
@@ -193,7 +195,7 @@ ROS Feedback/Result 应 **原样透传** `HardwareStatus.fault_code`。名称对
 | `FAULT_CMD_LOSS` | **11** | `MOTOR_FAULT_COMMAND_LOSS_LATCHED` | abort → HOLD | 草案建议值 `0x0001` **未采用** |
 | `FAULT_STALE_SEQUENCE` | **4** | `MOTOR_FAULT_STALE_SEQUENCE` | abort；按现网清序列/重启策略 | 草案建议值 `0x0002` **未采用** |
 | `FAULT_MOTOR` | **7** | `MOTOR_FAULT_DRIVE` | abort → HOLD；禁止继续激励 | 草案建议值 `0x0004` **未采用**；驱动故障现网常伴随 DISABLE |
-| `FAULT_EFFORT_LIMIT` | **3**（近义） | `MOTOR_FAULT_COMMAND_LIMIT` | abort → HOLD | 现网为 **收命令时** kp/kd/\|effort\| 超限拒绝，非运行中力矩限幅专用码 |
+| `FAULT_EFFORT_LIMIT` | **3**（近义） | `MOTOR_FAULT_COMMAND_LIMIT` | abort → HOLD | 现网为 **收命令时** kp/kd 为负或 \|effort\| 超限拒绝，非运行中力矩限幅专用码 |
 | `FAULT_VELOCITY_LIMIT` | — | （无固件码） | abort → HOLD | **ROS 侧**（或未来扩展）；勿占用现网 0–12 |
 | `FAULT_POSITION_DEVIATION` | — | （无固件码） | 姿态作废或整次 abort | **ROS 侧** |
 | `FAULT_GRIPPER_UNLOCKED` | — | （无固件码） | abort（若要求 lock_gripper） | **ROS 侧** |
