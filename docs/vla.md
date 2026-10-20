@@ -50,8 +50,8 @@ VLA 推理慢或断流时，有**两层**保护，互不替代：
 | 层级 | 条件 | 行为 |
 |------|------|------|
 | `vla_position_controller` | 超过 `command_timeout_sec`（默认 0.2 s）没有新 chunk，或 chunk 含 NaN | 保持最后一次实际下发的位置（限速后的值，不是最后的目标）；ros2_control 仍持续下发 TRACK 帧 |
-| 固件 `COMMAND_TIMEOUT_MS` | 100 ms 没收到合法 `JointCommand` | 自动切 **HOLD**：锁存当前位置，v=0、τ=0 |
-| 固件 `COMMAND_LOSS_LATCH_MS` | 非 DISABLE 状态下 500 ms 没有合法命令 | 锁存 `fault_code = 11`（CMD_LOSS），已使能则 HOLD，否则 DISABLE；**之后拒绝所有新命令，需安全回零并重启固件** |
+| 固件 `COMMAND_TIMEOUT_MS` | **仅 TRACK 模式下**，100 ms 没收到合法 `JointCommand` | 自动切 **HOLD**：锁存当前位置，v=0、τ=0。RETURN（mode 2）下不做这一步，会一直执行最后一帧直到 500 ms 锁存 |
+| 固件 `COMMAND_LOSS_LATCH_MS` | 非 DISABLE 状态（含 TRACK / HOLD / RETURN）下 500 ms 没有合法命令 | 锁存 `fault_code = 11`（CMD_LOSS），已使能则 HOLD，否则 DISABLE；**之后拒绝所有新命令，需安全回零并重启固件** |
 
 要点：
 
