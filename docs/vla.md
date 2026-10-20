@@ -49,16 +49,17 @@ VLA 推理慢或断流时，有**两层**保护，互不替代：
 
 | 层级 | 条件 | 行为 |
 |------|------|------|
-| `vla_position_controller` | 超过 `command_timeout_sec`（默认 0.2 s）没有新 chunk，或 chunk 含 NaN | 保持上一次有效目标角；ros2_control 仍持续下发 TRACK 帧 |
+| `vla_position_controller` | 超过 `command_timeout_sec`（默认 0.2 s）没有新 chunk，或 chunk 含 NaN | 保持最后一次实际下发的位置（限速后的值，不是最后的目标）；ros2_control 仍持续下发 TRACK 帧 |
 | 固件 `COMMAND_TIMEOUT_MS` | 100 ms 没收到合法 `JointCommand` | 自动切 **HOLD**：锁存当前位置，v=0、τ=0 |
 | 固件 `COMMAND_LOSS_LATCH_MS` | 非 DISABLE 状态下 500 ms 没有合法命令 | 锁存 `fault_code = 11`（CMD_LOSS），已使能则 HOLD，否则 DISABLE；**之后拒绝所有新命令，需安全回零并重启固件** |
 
 要点：
 
 1. **VLA 推理延迟不会触发固件超时**，只要 ros2_control 的控制循环和 Agent 链路在跑（控制器会持续发保持帧）。
-2. 触发固件超时的是 **ros2_control / Agent / USB 链路**中断，不是策略本身慢。
-3. 固件 HOLD 下 `effort = 0`，**没有重力补偿**；长时间 HOLD 时重关节会靠 kp/kd 硬扛重力，可能有下垂。
-4. fault 11 锁存后不能靠 Agent 重连解除，切换 VLA 前请确保链路稳定。
+2. 控制器有限速（默认 `max_delta_per_sec: 1.0`），chunk 需要持续发，单发一次只会走一小段。
+3. 触发固件超时的是 **ros2_control / Agent / USB 链路**中断，不是策略本身慢。
+4. 固件 HOLD 下 `effort = 0`，**没有重力补偿**；长时间 HOLD 时重关节会靠 kp/kd 硬扛重力，可能有下垂。
+5. fault 11 锁存后不能靠 Agent 重连解除，切换 VLA 前请确保链路稳定。
 
 ## 上线检查清单
 
@@ -68,7 +69,7 @@ VLA 推理慢或断流时，有**两层**保护，互不替代：
 2. **状态**：`ros2 topic hz /stm32/status` ≈ 250 Hz，`fault_code == 0`，`mode` 为 HOLD 或 DISABLE。
 3. **反馈**：`ros2 topic echo /stm32/joint_states --once`，6 个臂关节位置与实物一致。
 4. **控制器互斥**：`ros2 control list_controllers` 中 teleop / trajectory 为 inactive，再激活 `vla_position_controller`（见栈文档 `switch_controllers` 示例）。
-5. **Mock 先行**：先用 `ros2 run microros_stm32h723_bridge mock_vla_chunk_publisher.py`（默认 ±0.15 rad 正弦）验证，再接真实策略。
+5. **Mock 先行**：先用 `ros2 run microros_stm32h723_bridge mock_vla_chunk_publisher.py`（默认 ±0.15 rad 正弦）验证，再接真实策略。注意正弦以 **0 rad 绝对角**为中心，激活前先把臂放到零位附近，否则会以最高 1 rad/s 被拉向零位；只想测 HOLD 时激活控制器但不发 chunk。
 6. **观察**：运行中监看 `/stm32/status` 的 `last_command_sequence` 持续递增、`fault_code` 保持 0；`/stm32/joint_states` 的 `effort` 为实测力矩，可用来对比重力补偿效果。
 
 ## 常见故障对照
