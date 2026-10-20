@@ -32,6 +32,7 @@ export default defineConfig({
         text: '接口与集成',
         items: [
           { text: 'ROS 2 接口', link: '/ros2-interface' },
+          { text: 'VLA 接入（固件侧）', link: '/vla' },
           { text: 'FDCAN 集成', link: '/fdcan-integration' },
           { text: 'micro-ROS Session 稳定性', link: '/microros-session-stability' },
           { text: 'Vofa+ USB CDC', link: '/vofa-usb-cdc-integration' },
