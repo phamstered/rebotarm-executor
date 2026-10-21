@@ -67,10 +67,11 @@ VLA 推理慢或断流时，有**两层**保护，互不替代：
 
 1. **链路**：`lsusb` 能看到 `0483:5740 STM32 Virtual ComPort`；`micro-ros-agent-stm32h723.service` 为 active。
 2. **状态**：`ros2 topic hz /stm32/status` ≈ 250 Hz，`fault_code == 0`，`mode` 为 HOLD 或 DISABLE。
-3. **反馈**：`ros2 topic echo /stm32/joint_states --once`，6 个臂关节位置与实物一致。
-4. **控制器互斥**：`ros2 control list_controllers` 中 teleop / trajectory 为 inactive，再激活 `vla_position_controller`（见栈文档 `switch_controllers` 示例）。
-5. **Mock 先行**：先用 `ros2 run microros_stm32h723_bridge mock_vla_chunk_publisher.py`（默认 ±0.15 rad 正弦）验证，再接真实策略。注意正弦以 **0 rad 绝对角**为中心，激活前先把臂放到零位附近，否则会以最高 1 rad/s 被拉向零位；只想测 HOLD 时激活控制器但不发 chunk。
-6. **观察**：运行中监看 `/stm32/status` 的 `last_command_sequence` 持续递增、`fault_code` 保持 0；`/stm32/joint_states` 的 `effort` 为实测力矩，可用来对比重力补偿效果。
+3. **时间戳**：`ros2 topic echo /stm32/joint_states --once` 的 `header.stamp.sec > 0`（Agent epoch）。为 0 时先重启 Agent 或给 STM32 重新上电再建连；细节见 [ROS 2 接口 · Agent epoch](./ros2-interface#agent-epoch-与-headerstamp采集对齐)。采集前不要跳过这一步。
+4. **反馈**：同一帧里 6 个臂关节位置与实物一致。
+5. **控制器互斥**：`ros2 control list_controllers` 中 teleop / trajectory 为 inactive，再激活 `vla_position_controller`（见栈文档 `switch_controllers` 示例）。
+6. **Mock 先行**：先用 `ros2 run microros_stm32h723_bridge mock_vla_chunk_publisher.py`（默认 ±0.15 rad 正弦）验证，再接真实策略。注意正弦以 **0 rad 绝对角**为中心，激活前先把臂放到零位附近，否则会以最高 1 rad/s 被拉向零位；只想测 HOLD 时激活控制器但不发 chunk。
+7. **观察**：运行中监看 `/stm32/status` 的 `last_command_sequence` 持续递增、`fault_code` 保持 0；`/stm32/joint_states` 的 `effort` 为实测力矩，可用来对比重力补偿效果。
 
 ## 常见故障对照
 

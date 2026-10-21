@@ -105,6 +105,35 @@ TRACK 命令超过 100 ms 未更新时进入 HOLD；超过 500 ms 锁存通信�
 使用 Agent epoch，否则时间戳保持无效/零值。velocity 和 effort 反馈使用上表中
 对应电机型号的 MIT 量程解码。
 
+### Agent epoch 与 `header.stamp`（采集对齐）
+
+固件**没有**单独的「开时间戳」开关。session 建好后调用一次
+`rmw_uros_sync_session(1000)`；之后每帧用 `rmw_uros_epoch_millis()`：
+
+- 返回值 `> 0` → `/stm32/joint_states` 与 `/stm32/status` 的 `header.stamp` 写成 Agent 主机时间（与 Jetson 时钟同源）。
+- 返回值 `≤ 0` → stamp **保持 0**（`sec=0`、`nanosec=0`），表示尚未同步。
+
+前置条件：
+
+1. Jetson 上 `micro-ros-agent-stm32h723.service` 为 **active**，串口独占（`0483:5740` / `/dev/ttyACM*`）。
+2. 固件已与 Agent 建好 session（话题约 250 Hz 在刷）。
+3. 同步只在 **session 初始化时**做一次。若当时失败，stamp 会一直为 0，需要 **重启 Agent 或给 STM32 重新上电** 再走一遍建连，不能靠重连自动补同步。
+
+确认 stamp 非零（任选其一）：
+
+```bash
+# 应看到 sec 接近当前 Unix 时间，nanosec 非长期全 0
+ros2 topic echo /stm32/joint_states --once | sed -n '1,12p'
+
+# 连续看几帧：sec 应递增或与主机 date +%s 同量级
+ros2 topic echo /stm32/joint_states --field header.stamp
+date +%s
+```
+
+判定：`header.stamp.sec > 0` 且与主机当前秒数大致同量级（允许秒级偏差）。
+`sec == 0` 时不要开 LeRobot / bag 采集；对齐相机帧会失败。
+安全逻辑（TRACK 100 ms → HOLD、500 ms → fault 11）用的是 MCU 本地单调时钟，**不依赖** stamp。
+
 `HardwareStatus` 字段为：
 
 ```text
