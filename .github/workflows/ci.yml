@@ -14,6 +14,9 @@
 #   - hardware bring-up
 #   - micro-ROS agent / live XRCE session
 #   - Release build (Debug only for this workflow)
+#
+# Upcoming: switch this job to ghcr.io/phamstered/rebotarm-executor-ci@sha256:<digest>
+# (see docker/ci/ and .github/workflows/ci-image.yml); do not switch until the image exists.
 name: CI
 
 on:

@@ -1,0 +1,79 @@
+# Build and publish the STM32 firmware CI base image to GHCR.
+#
+# Image: ghcr.io/phamstered/rebotarm-executor-ci
+# Tags:  ubuntu22, ubuntu22-<short-sha>, ubuntu22-YYYYMMDD
+#
+# After the first successful publish, .github/workflows/ci.yml can pull
+# container: ghcr.io/phamstered/rebotarm-executor-ci:ubuntu22 (prefer digest pin).
+name: CI base image
+
+on:
+  workflow_dispatch:
+  push:
+    branches: ["main"]
+    paths:
+      - "docker/ci/**"
+      - ".github/workflows/ci-image.yml"
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  IMAGE_NAME: ghcr.io/phamstered/rebotarm-executor-ci
+
+jobs:
+  build-and-push:
+    name: Build and push GHCR image
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Docker metadata (tags / labels)
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.IMAGE_NAME }}
+          tags: |
+            type=raw,value=ubuntu22
+            type=sha,prefix=ubuntu22-,format=short
+            type=raw,value=ubuntu22-{{date 'YYYYMMDD'}}
+
+      - name: Build and push
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: docker/ci
+          file: docker/ci/Dockerfile
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+
+      - name: Summary (digest for ci.yml pin)
+        run: |
+          set -euo pipefail
+          DIGEST="${{ steps.build.outputs.digest }}"
+          echo "Published ${IMAGE_NAME}"
+          echo "Digest: ${DIGEST}"
+          echo "Prefer consuming by digest in a follow-up pin:"
+          echo "  container: ${IMAGE_NAME}@${DIGEST}"
+          {
+            echo "## CI base image"
+            echo ""
+            echo "- Image: \`${IMAGE_NAME}\`"
+            echo "- Digest: \`${DIGEST}\`"
+            echo "- Tags: \`ubuntu22\`, \`ubuntu22-<sha>\`, \`ubuntu22-YYYYMMDD\`"
+            echo "- Follow-up: pin \`.github/workflows/ci.yml\` to \`@${DIGEST}\` (do not rely on floating \`ubuntu22\` alone long-term)"
+          } >> "${GITHUB_STEP_SUMMARY}"
