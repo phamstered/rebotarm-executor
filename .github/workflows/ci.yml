@@ -15,9 +15,8 @@
 #   - micro-ROS agent / live XRCE session
 #   - Release build (Debug only for this workflow)
 #
-# Toolchain image: ghcr.io/phamstered/rebotarm-executor-ci:ubuntu22
-# (see docker/ci/ and .github/workflows/ci-image.yml). Prefer digest-pin after
-# the first successful publish. Split jobs avoid Docker-in-Docker for libmicroros.
+# Upcoming: switch this job to ghcr.io/phamstered/rebotarm-executor-ci@sha256:<digest>
+# (see docker/ci/ and .github/workflows/ci-image.yml); do not switch until the image exists.
 name: CI
 
 on:
@@ -26,17 +25,9 @@ on:
   pull_request:
     branches: ["main"]
 
-permissions:
-  contents: read
-  packages: read
-
-env:
-  LIBMICROROS_PATH: micro_ros_stm32cubemx_utils/microros_static_library/libmicroros
-
 jobs:
-  # Bare ubuntu so docker run of the official microros builder works (no DinD).
-  libmicroros:
-    name: Prepare libmicroros.a
+  build:
+    name: STM32 Debug firmware build
     runs-on: ubuntu-22.04
 
     steps:
@@ -45,11 +36,23 @@ jobs:
         with:
           submodules: recursive
 
+      - name: Install ARM GCC toolchain + CMake + Ninja
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y gcc-arm-none-eabi cmake ninja-build
+
+      - name: Verify toolchain
+        run: arm-none-eabi-gcc --version
+
+      # libmicroros.a is produced by the official micro-ROS static-library
+      # builder and is gitignored in the submodule. Cache by generation inputs
+      # so cold CI pays once; warm runs skip Docker rebuild.
       - name: Cache libmicroros
         id: cache-libmicroros
         uses: actions/cache@v4
         with:
-          path: ${{ env.LIBMICROROS_PATH }}
+          path: micro_ros_stm32cubemx_utils/microros_static_library/libmicroros
           key: libmicroros-${{ runner.os }}-${{ hashFiles('micro_ros_stm32cubemx_utils/microros_static_library/library_generation/**', 'Makefile') }}
           restore-keys: |
             libmicroros-${{ runner.os }}-
@@ -63,42 +66,10 @@ jobs:
           printf 'y\n' | docker run -i --rm -v "$PWD":/project \
             --env MICROROS_LIBRARY_FOLDER=micro_ros_stm32cubemx_utils/microros_static_library \
             microros/micro_ros_static_library_builder:humble
-          test -f "${LIBMICROROS_PATH}/libmicroros.a"
+          test -f micro_ros_stm32cubemx_utils/microros_static_library/libmicroros/libmicroros.a
 
       - name: Confirm libmicroros.a present
-        run: test -f "${LIBMICROROS_PATH}/libmicroros.a"
-
-      - name: Upload libmicroros artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: libmicroros
-          path: ${{ env.LIBMICROROS_PATH }}
-          if-no-files-found: error
-
-  build:
-    name: STM32 Debug firmware build
-    needs: libmicroros
-    runs-on: ubuntu-22.04
-    container:
-      image: ghcr.io/phamstered/rebotarm-executor-ci:ubuntu22
-
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-        with:
-          submodules: recursive
-
-      - name: Download libmicroros artifact
-        uses: actions/download-artifact@v4
-        with:
-          name: libmicroros
-          path: ${{ env.LIBMICROROS_PATH }}
-
-      - name: Confirm libmicroros.a present
-        run: test -f "${LIBMICROROS_PATH}/libmicroros.a"
-
-      - name: Verify toolchain
-        run: arm-none-eabi-gcc --version
+        run: test -f micro_ros_stm32cubemx_utils/microros_static_library/libmicroros/libmicroros.a
 
       - name: Configure (Debug)
         run: cmake --preset Debug

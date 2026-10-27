@@ -20,7 +20,9 @@ Not a flash / hardware / micro-ROS agent image.
 - Desk (`robot-debug-desk`) or Stack (`rebotarm-ros2-stack`) concerns
 
 `libmicroros` stays on Actions cache + a bare-metal job that can `docker run`
-the official builder (nested Docker inside `container:` jobs is painful).
+the official builder (nested Docker inside `container:` jobs is painful). A
+follow-up PR can split jobs or keep generation on the host when switching
+`ci.yml` onto this image.
 
 ## Local build
 
@@ -59,14 +61,12 @@ Tags pushed:
 The workflow prints the image **digest**. Prefer consuming
 `ghcr.io/phamstered/rebotarm-executor-ci@sha256:<digest>` rather than a floating tag.
 
-## Rollout / pin
+## Two-step rollout
 
-1. Merge this PR (Dockerfile + `ci-image.yml` + split-job `ci.yml`).
-2. Run **CI base image** (`workflow_dispatch`) once on `main` (or wait for the
-   path-filter push that landed `docker/ci/**`).
-3. Record the digest from the workflow summary.
-4. Follow-up (optional): pin `ci.yml` `container:` to `@sha256:<digest>` instead
-   of the floating `ubuntu22` tag.
-
-Until the image exists on GHCR, the `build` job that uses `container:` will fail
-to pull — publish first, then re-run CI.
+1. **This change** — Dockerfile + publish workflow only. `.github/workflows/ci.yml`
+   still runs on bare `ubuntu-22.04` with `apt-get install` for the toolchain
+   (same green path as `main`).
+2. **Follow-up PR** — after the image exists on GHCR, switch `ci.yml` to the
+   container and **digest-pin**
+   (`container: ghcr.io/phamstered/rebotarm-executor-ci@sha256:…`). Do not
+   switch until the image exists and the digest is recorded.
