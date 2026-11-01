@@ -107,17 +107,23 @@ TRACK 命令超过 100 ms 未更新时进入 HOLD；超过 500 ms 锁存通信�
 
 ### Agent epoch 与 `header.stamp`（采集对齐）
 
-固件**没有**单独的「开时间戳」开关。session 建好后调用一次
-`rmw_uros_sync_session(1000)`；之后每帧用 `rmw_uros_epoch_millis()`：
+固件在每次 session 建好后同步 Agent，运行期间每 5 秒重新同步。
+每次 `rmw_uros_sync_session(10)` 必须返回 `RMW_RET_OK`、同步状态为真，
+且本地单调时钟测得调用耗时不超过 20 ms，才更新 ROS 时间映射。
+失败按 1/2/5 秒退避；最近有效同步可维持 15 秒，之后显式输出零时间戳。
+重连时清除有效状态，不能沿用上一 session 的映射。
 
-- 返回值 `> 0` → `/stm32/joint_states` 与 `/stm32/status` 的 `header.stamp` 写成 Agent 主机时间（与 Jetson 时钟同源）。
-- 返回值 `≤ 0` → stamp **保持 0**（`sec=0`、`nanosec=0`），表示尚未同步。
+所有反馈使用同一 ROS epoch 映射：小于等于 100 ms 的纠偏以最多 100 ms/s
+平滑应用；更大的前进或回拨直接建立新的 clock epoch，并递增诊断 generation。
+不会把 15 秒前进偏差夹持成 15 秒冻结。接收端必须在 epoch 改变后清理相关 TF/
+状态历史；不可把 stamp=0 当成「最新时刻」。电机控制、HOLD 100 ms、故障 500 ms
+和发布调度继续使用原始单调 tick，不随 ROS 校时改变。
 
-前置条件：
+运行时同步与 executor 在同一通信任务串行执行，返回后立即 dispatch 输入缓冲，
+不并发访问 XRCE session。10 ms 为 API 等待预算，20 ms 为样本接纳阈值，
+并非未经硬件验证的严格 WCET；实际最大耗时和反馈空档由诊断记录。
 
-1. Jetson 上 `micro-ros-agent-stm32h723.service` 为 **active**，串口独占（`0483:5740` / `/dev/ttyACM*`）。
-2. 固件已与 Agent 建好 session（话题约 250 Hz 在刷）。
-3. 同步只在 **session 初始化时**做一次。若当时失败，stamp 会一直为 0，需要 **重启 Agent 或给 STM32 重新上电** 再走一遍建连，不能靠重连自动补同步。
+前置条件：Jetson 的 Agent active、串口独占、系统时间同步已就绪。
 
 确认 stamp 非零（任选其一）：
 
@@ -307,7 +313,8 @@ USB CDC 使用异步传输。micro-ROS `write()` 将完整字节流复制到 RAM
 验收要求在 100 Hz JointCommand 输入下 Jetson 实收 JointState 持续高于 200 Hz。
 旧阻塞式写入同时发布 JointState/HardwareStatus 时仅约 75 Hz，且会造成 RX overflow。
 
-`/stm32/microros_diagnostics.data` 固定为以下 16 项，计数器从 STM32 启动后累计：
+`/stm32/microros_diagnostics.data` v2 为 24 项，data[0]=2；原来的
+1–15 项顺序和含义保持不变。旧 v1 为 16 项。计数器从 STM32 启动后累计：
 
 ```text
 [schema_version, session_generation, last_exit_reason,
@@ -319,7 +326,7 @@ USB CDC 使用异步传输。micro-ROS `write()` 将完整字节流复制到 RAM
  usb_tx_overflow_count, usb_tx_high_water_mark]
 ```
 
-- `schema_version` 当前为 1。
+- `schema_version` 当前为 2。
 - `session_generation` 每次成功创建完整 ROS 实体后加一；正常运行应保持不变。
 - `last_exit_reason`：`0=NONE`、`1=连续 spin 错误`、`2=连续 ping 失败`、
   `3=实体初始化失败`。
@@ -331,3 +338,17 @@ USB CDC 使用异步传输。micro-ROS `write()` 将完整字节流复制到 RAM
   0。`usb_tx_high_water_mark` 用于核对最坏积压量，必须始终小于 16383。
 - `max_joint_state_publish_gap_ms` 是启动以来两次成功 JointState 发布之间的最大
   本地间隔；在上位机使用 100 ms timeout 时应始终显著小于 100。
+
+### 时钟诊断 v2 扩展
+
+| 索引 | 含义 |
+|---|---|
+| 16 | clock_state：0 未同步、1 同步有效、2 同步过期 |
+| 17 | 距最近有效同步的单调时间 ms；从未成功或重连失效为 UINT32_MAX |
+| 18 / 19 | 同步成功 / 失败累计次数 |
+| 20 / 21 | 最近 / 最大同步调用耗时 ms |
+| 22 | clock_epoch_generation；session 清理及新时间 epoch 时改变 |
+| 23 | 最近接纳样本相对当前映射的纠偏 ms，以 int32 二补码装入 uint32；正值为时钟需前移 |
+
+同步失效仍发布反馈，但三类带时间戳消息（JointState、HardwareStatus、零位状态）
+显式清零 stamp，避免残留上次值。诊断 1 Hz，关节/硬件目标频率仍为 250 Hz。

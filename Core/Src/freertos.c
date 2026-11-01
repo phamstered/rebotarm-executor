@@ -24,6 +24,7 @@
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
+#include "microros_clock_sync.h"
 #include "vofa.h"
 #include "cmsis_os2.h"
 #include "bsp_fdcan.h"
@@ -737,6 +738,27 @@ typedef struct {
   uint32_t max_joint_state_publish_gap_ms;
 } MicrorosDiagnostics;
 
+static MicrorosClockSync microros_clock;
+
+static uint64_t microros_monotonic_ms(void)
+{
+  TimeOut_t now = {0};
+  vTaskSetTimeOutState(&now);
+  uint64_t ticks = ((uint64_t)now.xOverflowCount << (sizeof(TickType_t) * 8U)) + now.xTimeOnEntering;
+  return ticks * 1000ULL / configTICK_RATE_HZ;
+}
+
+static void microros_sync_clock(void)
+{
+  uint64_t begin = microros_monotonic_ms();
+  rmw_ret_t result = rmw_uros_sync_session(10);
+  uint64_t end = microros_monotonic_ms();
+  bool success = result == RMW_RET_OK && rmw_uros_epoch_synchronized();
+  microros_clock_sample(&microros_clock, end,
+                       success ? rmw_uros_epoch_millis() : 0,
+                       success, (uint32_t)(end - begin));
+}
+
 static MicrorosDiagnostics microros_diagnostics;
 static const char *const joint_names[MOTOR_BRIDGE_JOINT_COUNT] = {
   "joint1", "joint2", "joint3", "joint4", "joint5", "joint6",
@@ -794,7 +816,13 @@ static void publish_timer_callback(rcl_timer_t *timer, int64_t last_call_time)
   status_message.active_joint_mask = snapshot.active_joint_mask;
   status_message.fault_code = snapshot.fault_code;
 
-  int64_t epoch_ms = rmw_uros_epoch_millis();
+  int64_t epoch_ms = microros_clock_stamp(&microros_clock, microros_monotonic_ms());
+  joint_state_message.header.stamp.sec = 0;
+  joint_state_message.header.stamp.nanosec = 0;
+  status_message.header.stamp.sec = 0;
+  status_message.header.stamp.nanosec = 0;
+  zero_state_message.header.stamp.sec = 0;
+  zero_state_message.header.stamp.nanosec = 0;
   if (epoch_ms > 0) {
     int32_t sec = (int32_t)(epoch_ms / 1000LL);
     uint32_t nanosec = (uint32_t)((epoch_ms % 1000LL) * 1000000LL);
@@ -858,7 +886,7 @@ static void publish_timer_callback(rcl_timer_t *timer, int64_t last_call_time)
 
   if ((uint32_t)(HAL_GetTick() - last_diagnostics_publish_ms) >=
       MICROROS_DIAGNOSTICS_PERIOD_MS) {
-    microros_diagnostics_message.data.data[0] = 1U;
+    microros_diagnostics_message.data.data[0] = 2U;
     microros_diagnostics_message.data.data[1] =
       microros_diagnostics.session_generation;
     microros_diagnostics_message.data.data[2] =
@@ -889,6 +917,15 @@ static void publish_timer_callback(rcl_timer_t *timer, int64_t last_call_time)
       microros_usb_tx_overflow_count();
     microros_diagnostics_message.data.data[15] =
       microros_usb_tx_high_water_mark();
+    uint64_t clock_now = microros_monotonic_ms();
+    microros_diagnostics_message.data.data[16] = microros_clock_state(&microros_clock, clock_now);
+    microros_diagnostics_message.data.data[17] = microros_clock_age(&microros_clock, clock_now);
+    microros_diagnostics_message.data.data[18] = microros_clock.success_count;
+    microros_diagnostics_message.data.data[19] = microros_clock.failure_count;
+    microros_diagnostics_message.data.data[20] = microros_clock.duration_ms;
+    microros_diagnostics_message.data.data[21] = microros_clock.max_duration_ms;
+    microros_diagnostics_message.data.data[22] = microros_clock.generation;
+    microros_diagnostics_message.data.data[23] = (uint32_t)microros_clock.correction_ms;
     if (rcl_publish(&microros_diagnostics_publisher,
                     &microros_diagnostics_message, NULL) != RCL_RET_OK) {
       microros_diagnostics.publish_failure_count++;
@@ -925,7 +962,7 @@ static bool init_ros_messages(void)
       !rosidl_runtime_c__uint32__Sequence__init(
           &zero_status_message.data, 6U) ||
       !rosidl_runtime_c__uint32__Sequence__init(
-          &microros_diagnostics_message.data, 16U)) {
+          &microros_diagnostics_message.data, 24U)) {
     return false;
   }
   for (uint32_t i = 0U; i < MOTOR_BRIDGE_JOINT_COUNT; i++) {
@@ -1075,7 +1112,8 @@ void StartMicrorosTask(void *argument)
       microros_diagnostics.session_generation++;
       microros_diagnostics.consecutive_ping_failures = 0U;
       microros_diagnostics.consecutive_spin_failures = 0U;
-      (void)rmw_uros_sync_session(1000);
+      microros_clock_reset(&microros_clock);
+      microros_sync_clock();
     }
 
     uint32_t last_ping_ms = HAL_GetTick();
@@ -1095,6 +1133,11 @@ void StartMicrorosTask(void *argument)
             MICROROS_EXIT_SPIN_ERROR;
           break;
         }
+      }
+      if (microros_clock_due(&microros_clock, microros_monotonic_ms())) {
+        microros_sync_clock();
+        /* Dispatch buffered input through the checked executor before ping. */
+        continue;
       }
       if ((uint32_t)(HAL_GetTick() - last_ping_ms) >=
           MICROROS_PING_PERIOD_MS) {
@@ -1122,6 +1165,7 @@ void StartMicrorosTask(void *argument)
       microros_diagnostics.last_exit_reason = MICROROS_EXIT_INIT_FAILURE;
     }
 
+    microros_clock_reset(&microros_clock);
     rcl_ret_t fini_result = RCL_RET_OK;
     if (support_ready) {
       rmw_context_t *rmw_context = rcl_context_get_rmw_context(&support.context);
