@@ -42,6 +42,11 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y gcc-arm-none-eabi cmake ninja-build
 
+      - name: Clock mapping host tests
+        run: |
+          cc -std=c11 -Wall -Wextra -Werror -ICore/Inc scripts/test_clock_sync.c -o /tmp/clock-sync-test
+          /tmp/clock-sync-test
+
       - name: Verify toolchain
         run: arm-none-eabi-gcc --version
 

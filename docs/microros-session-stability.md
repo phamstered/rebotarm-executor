@@ -63,3 +63,22 @@ overflow 和 write timeout 均为 0，TX 队列峰值 740/16383 字节。同期 
 无新增 `delete_client/create_client`，内核日志无 USB disconnect/error。追加 30 秒
 双 Topic 验收时，JointState 与 HardwareStatus 均为 250.4 Hz，最大主机空档分别为
 9.5 ms 和 9.6 ms，诊断计数仍未增加。
+
+## 持续校时验证
+
+时钟逻辑可离线测试：
+
+```bash
+cc -std=c11 -Wall -Wextra -Werror -ICore/Inc scripts/test_clock_sync.c -o /tmp/clock-sync-test
+/tmp/clock-sync-test
+```
+
+Debug 和 Release 均需构建。新增诊断采用接口文档定义的 24 项 v2。
+硬件未烧录前不能宣称校时空档或现场 TF 已修复。烧录仍须先安全停机并核验
+STM32H723VGTx、ST-Link 目标和 0x08000000 地址。
+
+使用以上全零 DISABLE 100 Hz 负载，连续运行至少 30 分钟，观测同步成功计数每约
+5 秒增长、调用最大耗时不超过 20 ms、JointState 最大空档小于 100 ms，且 session/
+USB 错误计数不增加。同步样本超时须进入重试而非重建 XRCE session。隔离环境模拟
+Agent 失联、主机前后跳时和重连，确认 15 秒过期 stamp 清零、大幅校正 generation
+改变以及恢复新时刻；控制 watchdog 不依赖可调整的 ROS epoch。
