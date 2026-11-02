@@ -27,7 +27,7 @@ best-effort QoS。关节顺序固定如下：
 | `/stm32/zero_position/set` | 订阅 | `std_msgs/msg/UInt32` | 单次请求 | 按掩码将当前位置设为零点 |
 | `/stm32/zero_position/state` | 发布 | `sensor_msgs/msg/JointState` | 结果变化及每 500 ms | 返回 RID54 零点偏置 |
 | `/stm32/zero_position/status` | 发布 | `std_msgs/msg/UInt32MultiArray` | 结果变化及每 500 ms | 零点操作状态和逐轴结果 |
-| `/stm32/microros_diagnostics` | 发布 | `std_msgs/msg/UInt32MultiArray` | 1 Hz | XRCE session、ping、executor 和 USB 诊断计数 |
+| `/stm32/microros_diagnostics` | 发布 | `std_msgs/msg/UInt32MultiArray` | 1 Hz | XRCE session、ping、executor、USB 与时钟同步诊断 |
 
 ## JointCommand
 
@@ -109,9 +109,11 @@ TRACK 命令超过 100 ms 未更新时进入 HOLD；超过 500 ms 锁存通信�
 
 固件在每次 session 建好后同步 Agent，运行期间每 5 秒重新同步。
 每次 `rmw_uros_sync_session(10)` 必须返回 `RMW_RET_OK`、同步状态为真，
-且本地单调时钟测得调用耗时不超过 20 ms，才更新 ROS 时间映射。
-失败按 1/2/5 秒退避；最近有效同步可维持 15 秒，之后显式输出零时间戳。
-重连时清除有效状态，不能沿用上一 session 的映射。
+epoch 毫秒为正且整秒不超过 int32 上限，并且本地单调时钟测得调用耗时不超过
+20 ms，才更新 ROS 时间映射。失败按 1/2/5 秒退避；最近有效同步可维持 15 秒。满 15 秒后
+`clock_state` 变为过期并显式输出零时间戳；此时 `valid` 仍为真，诊断年龄继续累计。
+成功建连和 session 退出都会 `microros_clock_reset`，把 `valid` 清掉（年龄变为
+`UINT32_MAX`），不能沿用上一 session 的映射。
 
 所有反馈使用同一 ROS epoch 映射：小于等于 100 ms 的纠偏以最多 100 ms/s
 平滑应用；更大的前进或回拨直接建立新的 clock epoch，并递增诊断 generation。
@@ -314,7 +316,8 @@ USB CDC 使用异步传输。micro-ROS `write()` 将完整字节流复制到 RAM
 旧阻塞式写入同时发布 JointState/HardwareStatus 时仅约 75 Hz，且会造成 RX overflow。
 
 `/stm32/microros_diagnostics.data` v2 为 24 项，data[0]=2；原来的
-1–15 项顺序和含义保持不变。旧 v1 为 16 项。计数器从 STM32 启动后累计：
+1–15 项顺序和含义保持不变。旧 v1 为 16 项。索引 0–15 里的计数器从 STM32
+启动后累计；索引 16–23 的语义见下方时钟诊断。完整顺序为：
 
 ```text
 [schema_version, session_generation, last_exit_reason,
@@ -323,7 +326,11 @@ USB CDC 使用异步传输。micro-ROS `write()` 将完整字节流复制到 RAM
  spin_failure_count, ping_failure_count, publish_failure_count,
  usb_rx_overflow_count, usb_write_timeout_count,
  joint_state_publish_count, max_joint_state_publish_gap_ms,
- usb_tx_overflow_count, usb_tx_high_water_mark]
+ usb_tx_overflow_count, usb_tx_high_water_mark,
+ clock_state, clock_sync_age_ms,
+ clock_sync_success_count, clock_sync_failure_count,
+ clock_sync_duration_ms, clock_sync_max_duration_ms,
+ clock_epoch_generation, clock_correction_ms]
 ```
 
 - `schema_version` 当前为 2。
@@ -344,10 +351,10 @@ USB CDC 使用异步传输。micro-ROS `write()` 将完整字节流复制到 RAM
 | 索引 | 含义 |
 |---|---|
 | 16 | clock_state：0 未同步、1 同步有效、2 同步过期 |
-| 17 | 距最近有效同步的单调时间 ms；从未成功或重连失效为 UINT32_MAX |
-| 18 / 19 | 同步成功 / 失败累计次数 |
-| 20 / 21 | 最近 / 最大同步调用耗时 ms |
-| 22 | clock_epoch_generation；session 清理及新时间 epoch 时改变 |
+| 17 | 距最近有效同步的单调时间 ms；未同步（含 reset 之后）为 UINT32_MAX。过期（state 2）仍报告真实年龄 |
+| 18 / 19 | 同步成功 / 失败累计次数（跨 session 累计，reset 不清零） |
+| 20 / 21 | 最近 / 最大同步调用耗时 ms；拒绝的样本也计入，最大耗时只增不减 |
+| 22 | clock_epoch_generation；成功建连与 session 退出时 reset 递增，当前无有效 stamp 或纠偏超过 100 ms 的新 epoch 也递增 |
 | 23 | 最近接纳样本相对当前映射的纠偏 ms，以 int32 二补码装入 uint32；正值为时钟需前移 |
 
 同步失效仍发布反馈，但三类带时间戳消息（JointState、HardwareStatus、零位状态）

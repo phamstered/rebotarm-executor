@@ -1,5 +1,14 @@
 # FDCAN 通信集成文档
 
+::: warning 现行总线
+电机桥的 FDCAN1/FDCAN2 使用经典 CAN。`Core/Src/main.c` 中
+`FrameFormat = FDCAN_FRAME_CLASSIC`；`User/bsp_fdcan.c` 发送时
+`FDFormat = FDCAN_CLASSIC_CAN`、`BitRateSwitch = FDCAN_BRS_OFF`。仲裁速率
+1 Mbit/s，7 电机控制周期以 [ROS 2 接口](./ros2-interface) 为准。下文保留早期
+FD + BRS 迁移笔记；其中的 5 Mbit/s 数据段和 `StartCanDemoTask` 与现固件不一致
+（演示任务已在 `freertos.c` 里注释掉）。
+:::
+
 ## 概述
 
 将 dm-mc02 项目的 FDCAN 实现迁移到 rebotarm_executor，配置 FDCAN1 为 CAN FD + BRS 模式，实现周期性 CAN 数据发送。

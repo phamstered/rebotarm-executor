@@ -42,4 +42,6 @@ cmake --build build/Debug --target clean
 
 ## 测试约定
 
-仓库当前无自动化单元测试目标。每次变更至少保证 **Debug 能编过**；涉及优化、时序或链接行为时再编 Release。硬件相关改动请在 PR 中写明板级配置，并附 FDCAN / 电机 / USB CDC 的观察结果或串口摘录。
+仓库当前无 CMake / ctest 单元测试目标。CI 在交叉编译前用主机 `cc` 运行
+`scripts/test_clock_sync.c`（命令见 [micro-ROS Session 稳定性](./microros-session-stability)）。
+每次变更至少保证 **Debug 能编过**；涉及优化、时序或链接行为时再编 Release。硬件相关改动请在 PR 中写明板级配置，并附 FDCAN / 电机 / USB CDC 的观察结果或串口摘录。

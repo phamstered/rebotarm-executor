@@ -17,7 +17,7 @@
 | `USB_DEVICE/` | USB CDC 设备栈 |
 | `vofa+/` | 遥测 / Vofa+ 波形相关 |
 | `docs/` | 技术说明与本 VitePress 站点源 |
-| `scripts/` | `flash.sh`、监控与 micro-ROS 负载脚本 |
+| `scripts/` | `flash.sh`、监控、micro-ROS 负载脚本，以及 `test_clock_sync.c` 主机校时测试 |
 | `Drivers/`、`Middlewares/`、`.ioc` 生成文件 | 厂商 / CubeMX 管理，勿随意重排 |
 
 CubeMX 生成文件中的手工修改必须落在 `/* USER CODE BEGIN ... */` 区域内。外设配置优先改 `rebotarm_executor.ioc`，再生成。

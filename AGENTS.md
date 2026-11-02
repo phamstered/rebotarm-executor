@@ -19,7 +19,9 @@ Use C11 and STM32 HAL style: four-space indentation, next-line function braces, 
 
 ## Testing Guidelines
 
-There is no automated unit-test target or coverage threshold. Every change must compile in Debug; build Release when changing optimization-sensitive, timing, or linker behavior. For hardware-facing changes, document the board setup and verify relevant FDCAN, motor, or USB CDC behavior. Include concise serial output or observed results in the pull request.
+There is no CMake unit-test target or coverage threshold. CI runs the host
+clock-mapping check `scripts/test_clock_sync.c` before the firmware build.
+Every change must compile in Debug; build Release when changing optimization-sensitive, timing, or linker behavior. For hardware-facing changes, document the board setup and verify relevant FDCAN, motor, or USB CDC behavior. Include concise serial output or observed results in the pull request.
 
 ## ROS 2 Interface Contract
 
