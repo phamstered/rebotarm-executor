@@ -80,5 +80,6 @@ STM32H723VGTx、ST-Link 目标和 0x08000000 地址。
 使用以上全零 DISABLE 100 Hz 负载，连续运行至少 30 分钟，观测同步成功计数每约
 5 秒增长、调用最大耗时不超过 20 ms、JointState 最大空档小于 100 ms，且 session/
 USB 错误计数不增加。同步样本超时须进入重试而非重建 XRCE session。隔离环境模拟
-Agent 失联、主机前后跳时和重连，确认 15 秒过期 stamp 清零、大幅校正 generation
-改变以及恢复新时刻；控制 watchdog 不依赖可调整的 ROS epoch。
+Agent 失联、主机前后跳时和重连，确认满 15 秒过期后 stamp 清零、纠偏超过
+100 ms（或重连后尚无有效 stamp）时 generation 改变，以及随后恢复新时刻；
+控制 watchdog 仍用 `HAL_GetTick()`，不依赖可调整的 ROS epoch。

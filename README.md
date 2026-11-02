@@ -82,7 +82,7 @@ npm run docs:dev
 
 ## CI
 
-- **STM32 Debug firmware build**（[`.github/workflows/ci.yml`](.github/workflows/ci.yml)）：`push` / `pull_request` → `main`；递归 submodule、按需生成 `libmicroros.a`、`cmake --preset Debug` 并确认 `rebotarm_executor.elf`。不覆盖烧录、实机联调、Agent 会话或 Release。
+- **STM32 Debug firmware build**（[`.github/workflows/ci.yml`](.github/workflows/ci.yml)）：`push` / `pull_request` → `main`；递归 submodule、时钟映射主机测试（`scripts/test_clock_sync.c`）、按需生成 `libmicroros.a`、`cmake --preset Debug` 并确认 `rebotarm_executor.elf`。不覆盖烧录、实机联调、Agent 会话或 Release。
 - **Deploy docs to GitHub Pages**（[`.github/workflows/deploy-docs.yml`](.github/workflows/deploy-docs.yml)）：`main` 推送或 `workflow_dispatch` 构建 VitePress 并部署；仓库 Settings → Pages → Source 需为 **GitHub Actions**。
 
 ## 安全
