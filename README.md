@@ -35,6 +35,18 @@
 ## 构建 / 烧录 / 监控
 
 需本机已安装 `arm-none-eabi-gcc`、CMake、Ninja；烧录另需 ST-Link 或 OpenOCD。
+首次构建或 `interfaces/` 消息更新后，先准备子模块并生成对应的 micro-ROS 静态库：
+
+```bash
+git submodule update --init --recursive
+python3 scripts/prepare_microros_interfaces.py
+printf 'y\n' | docker run -i --rm -v "$PWD":/project \
+  --env MICROROS_LIBRARY_FOLDER=micro_ros_stm32cubemx_utils/microros_static_library \
+  microros/micro_ros_static_library_builder:humble
+```
+
+V2 控制、异步切换和真实停机证明见[接口文档](docs/ros2-interface.md#pos-vel-v2-control-and-runtime-configuration)。
+POS_VEL 支持掩码默认 0，须完成逐型号/固件台架验证后才可开放。当前本地 Debug 链接占用约 93% DTCMRAM；运行时栈/堆余量仍需按接口文档完成台架测量。
 
 ```bash
 # 配置与编译（Debug）
@@ -82,7 +94,7 @@ npm run docs:dev
 
 ## CI
 
-- **STM32 Debug firmware build**（[`.github/workflows/ci.yml`](.github/workflows/ci.yml)）：`push` / `pull_request` → `main`；递归 submodule、时钟映射主机测试（`scripts/test_clock_sync.c`）、按需生成 `libmicroros.a`、`cmake --preset Debug` 并确认 `rebotarm_executor.elf`。不覆盖烧录、实机联调、Agent 会话或 Release。
+- **STM32 Debug firmware build**（[`.github/workflows/ci.yml`](.github/workflows/ci.yml)）：`push` / `pull_request` → `main`；递归 submodule、时钟映射及 V2 核心/CAN 模拟主机测试、按需生成 `libmicroros.a`、`cmake --preset Debug` 并确认 `rebotarm_executor.elf`。不覆盖烧录、实机联调、Agent 会话或 Release。
 - **Deploy docs to GitHub Pages**（[`.github/workflows/deploy-docs.yml`](.github/workflows/deploy-docs.yml)）：`main` 推送或 `workflow_dispatch` 构建 VitePress 并部署；仓库 Settings → Pages → Source 需为 **GitHub Actions**。
 
 ## 安全

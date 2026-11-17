@@ -3,6 +3,7 @@
 #include "FreeRTOS.h"
 #include "bsp_fdcan.h"
 #include "damiao_protocol.h"
+#include "motor_capabilities.h"
 #include "main.h"
 #include "task.h"
 
@@ -70,6 +71,13 @@ static const DamiaoLimits motor_limits[MOTOR_BRIDGE_JOINT_COUNT] = {{
 
 typedef struct {
     MotorBridgeCommand command;
+    MotorCommandV2 command_v2;
+    MotorControlV2 control;
+    bool using_v2;
+    uint32_t disable_ms;
+    uint32_t received_feedback_ms[MOTOR_BRIDGE_JOINT_COUNT];
+    bool have_disable;
+    bool disable_pending, disable_tx_wait;
     MotorBridgeSnapshot snapshot;
     uint32_t last_command_ms;
     bool have_command;
@@ -162,22 +170,87 @@ static void protocol_sleep(uint32_t ms, void *ctx)
     vTaskDelay(pdMS_TO_TICKS(ms));
 }
 
-static void send_disable(void)
+static uint16_t control_can_id(uint32_t i)
 {
+    return state.control.control_modes[i] == 2U ?
+        damiao_get_pos_vel_can_id(motor_ids[i]) : damiao_get_mit_can_id(motor_ids[i]);
+}
+
+static bool disabled_proven(uint32_t now)
+{
+    if (!state.have_disable || state.disable_pending || state.disable_tx_wait || state.snapshot.mode != MOTOR_MODE_DISABLE) return false;
+    for (uint32_t i = 0; i < MOTOR_BRIDGE_JOINT_COUNT; ++i) {
+        if (!(state.feedback_valid_mask & (1U << i)) ||
+            state.drive_status[i] != DAMIAO_STATUS_DISABLED ||
+            (int32_t)(state.received_feedback_ms[i] - state.disable_ms) <= 0 ||
+            (uint32_t)(now - state.received_feedback_ms[i]) > FEEDBACK_TIMEOUT_MS) return false;
+    }
+    return true;
+}
+
+static uint64_t boot_nonce(void)
+{
+    /* HSI48 is already enabled for USB. RNG failure disables only V2 admission. */
+    __HAL_RCC_RNG_CONFIG(RCC_RNGCLKSOURCE_HSI48);
+    __HAL_RCC_RNG_CLK_ENABLE();
+    /* Follow STM32H7 RNG v3.2 conditioning reset; preserve reset tuning fields. */
+    RNG->CR &= ~RNG_CR_RNGEN;
+    RNG->CR = (RNG->CR & ~RNG_CR_CED) | RNG_CR_CONDRST;
+    RNG->HTCR = 0x17590ABCU;
+    RNG->HTCR = 0x00007274U;
+    RNG->CR &= ~RNG_CR_CONDRST;
+    uint32_t reset_start = HAL_GetTick();
+    while (RNG->CR & RNG_CR_CONDRST)
+        if (HAL_GetTick() - reset_start > 10U) return 0;
+    RNG->CR |= RNG_CR_RNGEN;
+    uint64_t nonce = 0;
+    for (unsigned i = 0; i < 2; ++i) {
+        uint32_t start = HAL_GetTick();
+        while (!(RNG->SR & RNG_SR_DRDY)) {
+            if ((RNG->SR & (RNG_SR_SECS | RNG_SR_CECS | RNG_SR_SEIS | RNG_SR_CEIS)) || HAL_GetTick() - start > 10U) {
+                RNG->CR &= ~RNG_CR_RNGEN; return 0;
+            }
+        }
+        if (RNG->SR & (RNG_SR_SECS | RNG_SR_CECS | RNG_SR_SEIS | RNG_SR_CEIS)) { RNG->CR &= ~RNG_CR_RNGEN; return 0; }
+        nonce = (nonce << 32) | RNG->DR;
+    }
+    RNG->CR &= ~RNG_CR_RNGEN;
+    return nonce;
+}
+
+static bool runtime_register_send(uint8_t axis, bool write, uint32_t value, void *context)
+{
+    (void)context;
+    uint8_t data[DAMIAO_DLC];
+    if (write) damiao_encode_register_write_cmd(motor_ids[axis], DAMIAO_REG_CTRL_MODE, value, data);
+    else damiao_encode_register_read_cmd(motor_ids[axis], DAMIAO_REG_CTRL_MODE, data);
+    return send_frame(damiao_get_register_can_id(), data);
+}
+
+static bool send_disable(void)
+{
+    bool success = true;
     uint8_t data[DAMIAO_DLC];
     damiao_encode_disable_cmd(data);
     for (uint32_t i = 0U; i < MOTOR_BRIDGE_JOINT_COUNT; i++) {
-        if (!send_frame(damiao_get_mit_can_id(motor_ids[i]), data)) {
+        if (!send_frame(control_can_id(i), data)) {
+            success = false;
             state.snapshot.fault_code = MOTOR_FAULT_CAN_TX;
         }
-        state.motor_enabled[i] = false;
+        if (!state.control.control_modes[i]) {
+            /* Unknown during a failed write: stop both possible CAN channels. */
+            if (!send_frame(damiao_get_pos_vel_can_id(motor_ids[i]), data)) success = false;
+        }
         state.enable_pending[i] = false;
     }
+    return success;
 }
 
 static void set_mode(uint8_t mode)
 {
+    if (mode == MOTOR_MODE_DISABLE) motor_v2_disable(&state.control);
     if (state.snapshot.mode != mode) {
+        if (mode == MOTOR_MODE_DISABLE) state.disable_pending = true;
         state.snapshot.mode = mode;
         state.hold_latched = false;
     }
@@ -311,6 +384,19 @@ static void process_zero_request(void)
 void motor_bridge_init(void)
 {
     memset(&state, 0, sizeof(state));
+    motor_v2_init(&state.control, boot_nonce());
+    /* POS capabilities stay zero until each model/firmware is bench-qualified. */
+    for (uint32_t i = 0; i < MOTOR_BRIDGE_JOINT_COUNT; ++i) {
+        const MotorQualifiedCapability *cap = &motor_qualified_capabilities[i];
+        if (cap->pos_vel_qualified && isfinite(cap->position_min) &&
+            isfinite(cap->position_max) && isfinite(cap->velocity_limit_max) &&
+            cap->position_min < cap->position_max && cap->velocity_limit_max > 0) {
+            state.control.pos_vel_supported_mask |= 1U << i;
+            state.control.position_min[i] = cap->position_min;
+            state.control.position_max[i] = cap->position_max;
+            state.control.velocity_limit_max[i] = cap->velocity_limit_max;
+        }
+    }
     state.snapshot.mode = MOTOR_MODE_DISABLE;
     state.snapshot.active_joint_mask = MOTOR_BRIDGE_ACTIVE_JOINT_MASK;
     send_disable();
@@ -327,6 +413,8 @@ void motor_bridge_init(void)
             send_disable();
             return;
         }
+        state.control.control_modes[i] = 1U;
+        state.control.verified_joint_mask |= 1U << i;
         state.snapshot.position[i] = motor_state[i].last_feedback.pos;
         state.snapshot.velocity[i] = motor_state[i].last_feedback.vel;
         state.snapshot.effort[i] = motor_state[i].last_feedback.torq;
@@ -350,55 +438,124 @@ void motor_bridge_init(void)
 
 bool motor_bridge_accept_command(const MotorBridgeCommand *command, uint32_t now_ms)
 {
-    uint16_t fault = validate_command(command);
     taskENTER_CRITICAL();
-    if (!state.initialized) {
-        fault = MOTOR_FAULT_INIT;
-    } else if (state.zero_snapshot.busy) {
-        fault = MOTOR_FAULT_ZERO_POSITION_BUSY;
-    } else if (!state.communication_loss_latched && state.have_command &&
-        state.snapshot.mode != MOTOR_MODE_DISABLE &&
-        (uint32_t)(now_ms - state.last_command_ms) >
-            COMMAND_LOSS_LATCH_MS) {
-        state.communication_loss_latched = true;
-        state.snapshot.fault_code = MOTOR_FAULT_COMMAND_LOSS_LATCHED;
-        set_mode(any_motor_enabled() ? MOTOR_MODE_HOLD : MOTOR_MODE_DISABLE);
-    }
-    if (state.communication_loss_latched) {
-        fault = MOTOR_FAULT_COMMAND_LOSS_LATCHED;
-    } else if (fault == MOTOR_FAULT_NONE && state.have_command &&
-        !sequence_is_newer(command->sequence, state.command.sequence)) {
+    bool disable = command->mode == MOTOR_MODE_DISABLE;
+    uint16_t fault = disable ? MOTOR_FAULT_NONE : validate_command(command);
+    if (!state.initialized && !disable) fault = MOTOR_FAULT_INIT;
+    else if (!disable && !motor_v2_mit_allowed(&state.control)) fault = MOTOR_FAULT_CONTROL_MODE;
+    else if (state.have_command && !sequence_is_newer(command->sequence, state.snapshot.last_command_sequence))
         fault = MOTOR_FAULT_STALE_SEQUENCE;
-    }
+    else if (!disable && state.zero_snapshot.busy) fault = MOTOR_FAULT_ZERO_POSITION_BUSY;
+    else if (!disable && state.have_command && state.snapshot.mode != MOTOR_MODE_DISABLE &&
+        (uint32_t)(now_ms - state.last_command_ms) > COMMAND_LOSS_LATCH_MS)
+        state.communication_loss_latched = true;
+    if (!disable && state.communication_loss_latched) fault = MOTOR_FAULT_COMMAND_LOSS_LATCHED;
     if (fault != MOTOR_FAULT_NONE) {
-        state.snapshot.fault_code = fault;
-        taskEXIT_CRITICAL();
-        return false;
+        /* Wrong-protocol traffic is diagnostic only and cannot disturb its owner. */
+        if (fault == MOTOR_FAULT_CONTROL_MODE) {
+            state.control.rejected_sequence = command->sequence;
+            state.control.reject_code = MV2_MODE;
+        } else if (!state.communication_loss_latched) state.snapshot.fault_code = fault;
+        taskEXIT_CRITICAL(); return false;
     }
-
     state.command = *command;
+    if (disable) {
+        memset(&state.command, 0, sizeof(state.command));
+        state.command.sequence = command->sequence;
+        state.command.mode = MOTOR_MODE_DISABLE;
+        state.disable_ms = now_ms;
+        state.have_disable = true;
+        state.disable_pending = true;
+        motor_v2_disable(&state.control);
+    } else { state.using_v2 = false; state.have_disable = false; }
     state.have_command = true;
     state.last_command_ms = now_ms;
     state.snapshot.last_command_sequence = command->sequence;
-    state.snapshot.fault_code = MOTOR_FAULT_NONE;
+    state.snapshot.fault_code = state.communication_loss_latched ? MOTOR_FAULT_COMMAND_LOSS_LATCHED : MOTOR_FAULT_NONE;
     set_mode(command->mode);
+    taskEXIT_CRITICAL(); return true;
+}
+
+bool motor_bridge_accept_command_v2(const MotorCommandV2 *command, uint32_t now_ms)
+{
+    taskENTER_CRITICAL();
+    uint16_t fault = state.communication_loss_latched ? MOTOR_FAULT_COMMAND_LOSS_LATCHED : state.snapshot.fault_code;
+    if (!state.initialized || state.zero_snapshot.busy) fault = MOTOR_FAULT_INIT;
+    uint16_t error = MV2_OK;
+    if (command->mode == MOTOR_MODE_HOLD) {
+        for (uint32_t i = 0; i < MOTOR_BRIDGE_JOINT_COUNT; ++i) {
+            if (!(command->active_joint_mask & (1U << i))) continue;
+            if (!(state.feedback_valid_mask & (1U << i)) ||
+                (uint32_t)(now_ms - state.received_feedback_ms[i]) > FEEDBACK_TIMEOUT_MS)
+                error = MV2_FAULT;
+            else if (!isfinite(state.snapshot.position[i]) ||
+                state.snapshot.position[i] < state.control.position_min[i] ||
+                state.snapshot.position[i] > state.control.position_max[i]) error = MV2_LIMITS;
+        }
+    }
+    if (!error) error = motor_v2_command(&state.control, command, fault, state.have_command,
+                                        state.snapshot.last_command_sequence, now_ms);
+    else { state.control.rejected_sequence = command->sequence; state.control.reject_code = error; }
+    if (!error) {
+        state.have_disable = false;
+        state.command_v2 = *command;
+        state.using_v2 = true;
+        state.have_command = true;
+        state.last_command_ms = now_ms;
+        state.snapshot.last_command_sequence = command->sequence;
+        set_mode(command->mode);
+    }
+    taskEXIT_CRITICAL(); return error == MV2_OK;
+}
+
+MotorControlResponse motor_bridge_control_request(const MotorControlRequest *request, uint32_t now_ms)
+{
+    taskENTER_CRITICAL();
+    uint16_t fault = state.communication_loss_latched ? MOTOR_FAULT_COMMAND_LOSS_LATCHED : state.snapshot.fault_code;
+    if (!state.initialized || state.zero_snapshot.busy) fault = MOTOR_FAULT_INIT;
+    MotorControlResponse response = motor_v2_request(&state.control, request,
+        disabled_proven(now_ms), fault, state.snapshot.last_command_sequence, now_ms);
+    if (response.accepted && request->action == 4U) set_mode(MOTOR_MODE_DISABLE);
+    taskEXIT_CRITICAL(); return response;
+}
+
+void motor_bridge_get_control_snapshot(MotorControlSnapshot *snapshot)
+{
+    taskENTER_CRITICAL();
+    snapshot->control = state.control;
+    snapshot->disabled_verified = disabled_proven(HAL_GetTick());
+    snapshot->enabled_joint_mask = 0;
+    for (uint32_t i = 0; i < MOTOR_BRIDGE_JOINT_COUNT; ++i)
+        if (state.motor_enabled[i]) snapshot->enabled_joint_mask |= 1U << i;
+    snapshot->last_command_sequence = state.snapshot.last_command_sequence;
+    snapshot->mode = state.snapshot.mode;
+    snapshot->fault_code = state.communication_loss_latched ? MOTOR_FAULT_COMMAND_LOSS_LATCHED : state.snapshot.fault_code;
     taskEXIT_CRITICAL();
-    return true;
 }
 
 static void consume_feedback(uint32_t now_ms)
 {
     uint16_t can_id;
+    uint32_t received_ms;
     uint8_t data[DAMIAO_DLC];
-    while (fdcan1_get_rx_data(&can_id, data) == DAMIAO_DLC) {
+    while (fdcan1_get_rx_data_at(&can_id, data, &received_ms) == DAMIAO_DLC) {
         for (uint32_t i = 0U; i < MOTOR_BRIDGE_JOINT_COUNT; i++) {
             if (can_id == feedback_ids[i]) {
+                if (damiao_is_register_reply(data) || damiao_is_register_write_ack(data)) {
+                    if (data[0] == motor_ids[i] && data[1] == 0U && data[3] == DAMIAO_REG_CTRL_MODE) {
+                        uint32_t value; memcpy(&value, data + 4, sizeof(value));
+                        motor_v2_register_reply(&state.control, (uint8_t)i,
+                            damiao_is_register_write_ack(data), value, now_ms);
+                    }
+                    break;
+                }
                 DamiaoFeedback feedback;
                 damiao_decode_sensor_feedback(data, &motor_limits[i], &feedback);
                 state.snapshot.position[i] = feedback.pos;
                 state.snapshot.velocity[i] = feedback.vel;
                 state.snapshot.effort[i] = feedback.torq;
                 state.snapshot.last_feedback_ms[i] = now_ms;
+                state.received_feedback_ms[i] = received_ms;
                 bool finite = isfinite(feedback.pos) &&
                     isfinite(feedback.vel) && isfinite(feedback.torq);
                 if (finite) state.feedback_valid_mask |= (1UL << i);
@@ -422,14 +579,24 @@ static void consume_feedback(uint32_t now_ms)
             MOTOR_BRIDGE_ACTIVE_JOINT_MASK;
 }
 
-void motor_bridge_control_step(uint32_t now_ms)
+static void control_step_locked(uint32_t now_ms)
 {
     uint8_t data[DAMIAO_DLC];
-    consume_feedback(now_ms);
-    if (state.zero_snapshot.busy) {
-        process_zero_request();
-        return;
+    if (state.disable_pending && send_disable()) {
+        state.disable_pending = false;
+        state.disable_tx_wait = true;
     }
+    /* Wait for actual CAN transmission before requesting post-stop feedback.
+     * This is a nonblocking FIFO query, never a busy wait in the 4 ms loop. */
+    if (state.disable_tx_wait && fdcan1_tx_empty()) {
+        state.disable_tx_wait = false;
+        state.disable_ms = now_ms;
+        for (uint32_t i = 0; i < MOTOR_BRIDGE_JOINT_COUNT; ++i)
+            state.last_feedback_request_ms[i] = now_ms - DISABLED_FEEDBACK_REQUEST_MS;
+    }
+    consume_feedback(now_ms);
+    if (state.disable_pending || state.disable_tx_wait) return;
+    motor_v2_step(&state.control, disabled_proven(now_ms), now_ms, runtime_register_send, NULL);
 
     for (uint32_t i = 0U; i < MOTOR_BRIDGE_JOINT_COUNT; i++) {
         /* A disabled Damiao drive does not stream feedback autonomously. */
@@ -450,10 +617,9 @@ void motor_bridge_control_step(uint32_t now_ms)
         for (uint32_t i = 0U; i < MOTOR_BRIDGE_JOINT_COUNT; i++) {
             if (state.motor_enabled[i]) {
                 damiao_encode_disable_cmd(data);
-                if (!send_frame(damiao_get_mit_can_id(motor_ids[i]), data)) {
-                    state.snapshot.fault_code = MOTOR_FAULT_CAN_TX;
-                }
-                state.motor_enabled[i] = false;
+                if (!send_frame(control_can_id(i), data)) state.snapshot.fault_code = MOTOR_FAULT_CAN_TX;
+                if (!state.control.control_modes[i])
+                    (void)send_frame(damiao_get_pos_vel_can_id(motor_ids[i]), data);
             }
             state.enable_pending[i] = false;
         }
@@ -467,8 +633,34 @@ void motor_bridge_control_step(uint32_t now_ms)
         return;
     }
 
+    if (state.snapshot.mode == MOTOR_MODE_HOLD) {
+        if (!state.hold_latched) {
+            for (uint32_t i = 0U; i < MOTOR_BRIDGE_JOINT_COUNT; i++) {
+                if (state.using_v2 && (state.command_v2.active_joint_mask & (1U << i)) &&
+                    (!isfinite(state.snapshot.position[i]) ||
+                     state.snapshot.position[i] < state.control.position_min[i] ||
+                     state.snapshot.position[i] > state.control.position_max[i])) {
+                    state.snapshot.fault_code = MOTOR_FAULT_COMMAND_LIMIT;
+                    set_mode(MOTOR_MODE_DISABLE); send_disable(); return;
+                }
+                state.hold_position[i] = state.snapshot.position[i];
+            }
+            state.hold_latched = true;
+        }
+    }
+
+    uint32_t selected = state.using_v2 ? state.command_v2.active_joint_mask : MOTOR_BRIDGE_ACTIVE_JOINT_MASK;
     bool all_enabled = true;
     for (uint32_t i = 0U; i < MOTOR_BRIDGE_JOINT_COUNT; i++) {
+        if (!(selected & (1U << i))) {
+            if (state.motor_enabled[i]) {
+                damiao_encode_disable_cmd(data);
+                (void)send_frame(control_can_id(i), data);
+                all_enabled = false;
+            }
+            state.enable_pending[i] = false;
+            continue;
+        }
         if (!state.motor_enabled[i]) {
             all_enabled = false;
             if (!state.enable_pending[i]) {
@@ -484,8 +676,19 @@ void motor_bridge_control_step(uint32_t now_ms)
             }
             if ((uint32_t)(now_ms - state.last_enable_ms[i]) >=
                     ENABLE_RETRY_MS) {
+                /* A drive may retain its previous target while disabled. Load
+                 * the admitted target before enable so old goals cannot run. */
+                if (state.using_v2) {
+                    damiao_encode_pos_vel_cmd(state.snapshot.mode == MOTOR_MODE_HOLD ?
+                        state.hold_position[i] : state.command_v2.position[i],
+                        state.command_v2.velocity_limit[i], data);
+                    if (!send_frame(control_can_id(i), data)) {
+                        state.snapshot.fault_code = MOTOR_FAULT_CAN_TX;
+                        set_mode(MOTOR_MODE_DISABLE); send_disable(); return;
+                    }
+                }
                 damiao_encode_enable_cmd(data);
-                if (!send_frame(damiao_get_mit_can_id(motor_ids[i]), data)) {
+                if (!send_frame(control_can_id(i), data)) {
                     state.snapshot.fault_code = MOTOR_FAULT_CAN_TX;
                     set_mode(MOTOR_MODE_DISABLE);
                     send_disable();
@@ -501,17 +704,14 @@ void motor_bridge_control_step(uint32_t now_ms)
         return;
     }
 
-    if (state.snapshot.mode == MOTOR_MODE_HOLD) {
-        if (!state.hold_latched) {
-            for (uint32_t i = 0U; i < MOTOR_BRIDGE_JOINT_COUNT; i++) {
-                state.hold_position[i] = state.snapshot.position[i];
-            }
-            state.hold_latched = true;
-        }
-    }
 
     for (uint32_t i = 0U; i < MOTOR_BRIDGE_JOINT_COUNT; i++) {
-        if (state.snapshot.mode == MOTOR_MODE_HOLD) {
+        if (!(selected & (1U << i))) continue;
+        if (state.using_v2) {
+            damiao_encode_pos_vel_cmd(state.snapshot.mode == MOTOR_MODE_HOLD ?
+                state.hold_position[i] : state.command_v2.position[i],
+                state.command_v2.velocity_limit[i], data);
+        } else if (state.snapshot.mode == MOTOR_MODE_HOLD) {
             damiao_encode_mit_cmd(state.hold_position[i], 0.0f, 0.0f,
                                   state.command.kp[i], state.command.kd[i],
                                   &motor_limits[i], data);
@@ -521,13 +721,24 @@ void motor_bridge_control_step(uint32_t now_ms)
                                   state.command.effort[i], state.command.kp[i],
                                   state.command.kd[i], &motor_limits[i], data);
         }
-        if (!send_frame(damiao_get_mit_can_id(motor_ids[i]), data)) {
+        if (!send_frame(control_can_id(i), data)) {
             state.snapshot.fault_code = MOTOR_FAULT_CAN_TX;
             set_mode(MOTOR_MODE_DISABLE);
             send_disable();
             return;
         }
     }
+}
+
+void motor_bridge_control_step(uint32_t now_ms)
+{
+    /* Maintenance uses blocking register helpers and stays outside this lock.
+     * The normal path contains bounded RX dequeue and nonblocking CAN enqueues;
+     * serialize it with callbacks so DISABLE cannot race a late enable/frame. */
+    if (state.zero_snapshot.busy) { process_zero_request(); return; }
+    taskENTER_CRITICAL();
+    control_step_locked(now_ms);
+    taskEXIT_CRITICAL();
 }
 
 void motor_bridge_safety_step(uint32_t now_ms)
@@ -551,6 +762,7 @@ void motor_bridge_safety_step(uint32_t now_ms)
             set_mode(MOTOR_MODE_DISABLE);
         }
     }
+    motor_v2_watchdog(&state.control, now_ms);
     if (state.have_command) {
         uint32_t age = now_ms - state.last_command_ms;
         if (state.snapshot.mode == MOTOR_MODE_TRACK && age > COMMAND_TIMEOUT_MS) {
@@ -559,6 +771,7 @@ void motor_bridge_safety_step(uint32_t now_ms)
         if (state.snapshot.mode != MOTOR_MODE_DISABLE &&
             age > COMMAND_LOSS_LATCH_MS) {
             state.communication_loss_latched = true;
+            motor_v2_fault(&state.control);
             state.snapshot.fault_code = MOTOR_FAULT_COMMAND_LOSS_LATCHED;
             set_mode(any_motor_enabled() ? MOTOR_MODE_HOLD : MOTOR_MODE_DISABLE);
         }
@@ -570,6 +783,7 @@ void motor_bridge_get_snapshot(MotorBridgeSnapshot *snapshot)
 {
     taskENTER_CRITICAL();
     *snapshot = state.snapshot;
+    if (state.communication_loss_latched) snapshot->fault_code = MOTOR_FAULT_COMMAND_LOSS_LATCHED;
     taskEXIT_CRITICAL();
 }
 
@@ -577,7 +791,7 @@ bool motor_bridge_request_zero_position(uint8_t operation, uint32_t joint_mask)
 {
     joint_mask &= MOTOR_BRIDGE_ACTIVE_JOINT_MASK;
     taskENTER_CRITICAL();
-    if (state.zero_pending_operation != MOTOR_ZERO_OPERATION_NONE ||
+    if (!motor_v2_mit_allowed(&state.control) || state.zero_pending_operation != MOTOR_ZERO_OPERATION_NONE ||
         state.zero_snapshot.busy) {
         taskEXIT_CRITICAL();
         return false;

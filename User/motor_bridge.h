@@ -3,6 +3,7 @@
 
 #include <stdbool.h>
 #include <stdint.h>
+#include "motor_control_v2.h"
 
 #define MOTOR_BRIDGE_JOINT_COUNT 7U
 #define MOTOR_BRIDGE_ACTIVE_JOINT_MASK 0x7FUL
@@ -28,7 +29,8 @@ typedef enum {
     MOTOR_FAULT_INIT = 9,
     MOTOR_FAULT_ENABLE_TIMEOUT = 10,
     MOTOR_FAULT_COMMAND_LOSS_LATCHED = 11,
-    MOTOR_FAULT_ZERO_POSITION_BUSY = 12
+    MOTOR_FAULT_ZERO_POSITION_BUSY = 12,
+    MOTOR_FAULT_CONTROL_MODE = 13
 } MotorBridgeFault;
 
 typedef enum {
@@ -82,6 +84,17 @@ typedef struct {
     float output_offset[MOTOR_BRIDGE_JOINT_COUNT];
 } MotorBridgeZeroSnapshot;
 
+typedef struct {
+    MotorControlV2 control;
+    uint32_t enabled_joint_mask;
+    bool disabled_verified;
+    uint32_t last_command_sequence;
+    uint8_t mode;
+    uint16_t fault_code;
+} MotorControlSnapshot;
+void motor_bridge_get_control_snapshot(MotorControlSnapshot *snapshot);
+MotorControlResponse motor_bridge_control_request(const MotorControlRequest *request, uint32_t now_ms);
+bool motor_bridge_accept_command_v2(const MotorCommandV2 *command, uint32_t now_ms);
 void motor_bridge_init(void);
 bool motor_bridge_accept_command(const MotorBridgeCommand *command, uint32_t now_ms);
 void motor_bridge_control_step(uint32_t now_ms);

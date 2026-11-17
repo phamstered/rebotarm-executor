@@ -3,12 +3,14 @@
 
 #include "main.h"
 #include <stdint.h>
+#include <stdbool.h>
 #include "FreeRTOS.h"
 #include "task.h"
 
 #define BSP_FDCAN_RX_QUEUE_DEPTH 16U
 
 typedef struct {
+    uint32_t received_ms;
     uint16_t id;
     uint8_t len;
     uint8_t data[8];
@@ -21,6 +23,8 @@ uint8_t fdcanx_receive(FDCAN_HandleTypeDef *hfdcan, uint16_t *rec_id, uint8_t *b
 /* FDCAN1 接收接口 */
 void fdcan1_register_rx_task(TaskHandle_t handle);
 uint8_t fdcan1_get_rx_data(uint16_t *id, uint8_t *buf);
+uint8_t fdcan1_get_rx_data_at(uint16_t *id, uint8_t *buf, uint32_t *received_ms);
+bool fdcan1_tx_empty(void);
 uint32_t fdcan1_get_rx_overflow_count(void);
 
 /* FDCAN2 接收接口 */

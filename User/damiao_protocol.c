@@ -276,7 +276,8 @@ int damiao_read_register_u32(const DamiaoModeSwitchCtx *ctx, uint8_t rid,
         uint32_t wait_ms = timeout_ms - elapsed;
         if (wait_ms > 5U) wait_ms = 5U;
         if (ctx->recv(&recv_id, recv_data, wait_ms, ctx->user_ctx) == 0 &&
-            damiao_decode_register_value(recv_data, &rv) && rv.rid == rid) {
+            damiao_decode_register_value(recv_data, &rv) && rv.rid == rid &&
+            recv_data[0] == (uint8_t)ctx->motor_id && recv_data[1] == (uint8_t)(ctx->motor_id >> 8)) {
             *value = damiao_decode_register_u32(rv.data);
             return DAMIAO_ERR_OK;
         }
@@ -306,7 +307,8 @@ int damiao_write_register_u32(const DamiaoModeSwitchCtx *ctx, uint8_t rid,
         uint32_t wait_ms = timeout_ms - elapsed;
         if (wait_ms > 5U) wait_ms = 5U;
         if (ctx->recv(&recv_id, recv_data, wait_ms, ctx->user_ctx) == 0 &&
-            damiao_is_register_write_ack(recv_data) && recv_data[3] == rid) {
+            damiao_is_register_write_ack(recv_data) && recv_data[3] == rid &&
+            recv_data[0] == (uint8_t)ctx->motor_id && recv_data[1] == (uint8_t)(ctx->motor_id >> 8)) {
             return DAMIAO_ERR_OK;
         }
         elapsed += wait_ms;
@@ -600,7 +602,8 @@ static int write_register_u32_once_and_verify(const DamiaoModeSwitchCtx *ctx,
         uint32_t wait_ms = timeout_ms - elapsed;
         if (wait_ms > 5U) wait_ms = 5U;
         if (ctx->recv(&recv_id, recv_data, wait_ms, ctx->user_ctx) == 0 &&
-            damiao_is_register_write_ack(recv_data) && recv_data[3] == rid) {
+            damiao_is_register_write_ack(recv_data) && recv_data[3] == rid &&
+            recv_data[0] == (uint8_t)ctx->motor_id && recv_data[1] == (uint8_t)(ctx->motor_id >> 8)) {
             uint32_t ack_value = (uint32_t)recv_data[4]
                                | ((uint32_t)recv_data[5] << 8)
                                | ((uint32_t)recv_data[6] << 16)

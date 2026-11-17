@@ -50,6 +50,9 @@
 #include <sensor_msgs/msg/joint_state.h>
 #include <microros_stm32h723_bridge/msg/joint_command.h>
 #include <microros_stm32h723_bridge/msg/hardware_status.h>
+#include <microros_stm32h723_bridge/msg/joint_command_v2.h>
+#include <microros_stm32h723_bridge/msg/motor_control_status.h>
+#include <microros_stm32h723_bridge/srv/motor_control.h>
 #include <rosidl_runtime_c/string_functions.h>
 #include <rosidl_runtime_c/primitives_sequence_functions.h>
 
@@ -694,6 +697,12 @@ void StartDamiaoMotorTask(void *argument)
 
 static rcl_publisher_t joint_state_publisher;
 static rcl_publisher_t status_publisher;
+static rcl_publisher_t motor_control_publisher;
+static microros_stm32h723_bridge__msg__MotorControlStatus motor_control_message;
+static microros_stm32h723_bridge__msg__JointCommandV2 command_v2_message;
+static microros_stm32h723_bridge__srv__MotorControl_Request motor_control_request;
+static microros_stm32h723_bridge__srv__MotorControl_Response motor_control_response;
+static uint32_t last_control_publish_ms;
 static rcl_publisher_t zero_state_publisher;
 static rcl_publisher_t zero_status_publisher;
 static rcl_publisher_t microros_diagnostics_publisher;
@@ -781,6 +790,78 @@ static void joint_command_callback(const void *message)
   (void)motor_bridge_accept_command(&command, HAL_GetTick());
 }
 
+static void joint_command_v2_callback(const void *message)
+{
+  const microros_stm32h723_bridge__msg__JointCommandV2 *input = message;
+  MotorCommandV2 command = {0};
+  command.boot_id = input->boot_id;
+  command.control_epoch = input->control_epoch;
+  command.source_id = input->source_id;
+  command.lease_id = input->lease_id;
+  command.sequence = input->sequence;
+  command.mode = input->mode;
+  command.control_mode = input->control_mode;
+  command.active_joint_mask = input->active_joint_mask;
+  memcpy(command.position, input->position, sizeof(command.position));
+  memcpy(command.velocity_limit, input->velocity_limit, sizeof(command.velocity_limit));
+  (void)motor_bridge_accept_command_v2(&command, HAL_GetTick());
+}
+
+static void motor_control_callback(const void *request, void *response)
+{
+  const microros_stm32h723_bridge__srv__MotorControl_Request *input = request;
+  microros_stm32h723_bridge__srv__MotorControl_Response *output = response;
+  MotorControlRequest command = {0};
+  command.action = input->action;
+  command.operation_id = input->operation_id;
+  command.boot_id = input->boot_id;
+  command.expected_control_epoch = input->expected_control_epoch;
+  command.source_id = input->source_id;
+  command.active_joint_mask = input->active_joint_mask;
+  command.control_mode = input->control_mode;
+  command.lease_id = input->lease_id;
+  command.disable_sequence = input->disable_sequence;
+  MotorControlResponse result = motor_bridge_control_request(&command, HAL_GetTick());
+  output->accepted = result.accepted;
+  output->error_code = result.error_code;
+  output->control_epoch = result.control_epoch;
+  output->lease_id = result.lease_id;
+  output->operation_id = result.operation_id;
+}
+
+static void publish_motor_control_status(void)
+{
+  MotorControlSnapshot snapshot;
+  motor_bridge_get_control_snapshot(&snapshot);
+  MotorControlV2 *control = &snapshot.control;
+  motor_control_message.header.stamp = status_message.header.stamp;
+  motor_control_message.protocol_version = 2;
+  motor_control_message.boot_id = control->boot_id;
+  motor_control_message.control_epoch = control->control_epoch;
+  motor_control_message.owner_source_id = control->owner_source_id;
+  motor_control_message.lease_id = control->lease_id;
+  motor_control_message.selected_joint_mask = control->selected_joint_mask;
+  motor_control_message.enabled_joint_mask = snapshot.enabled_joint_mask;
+  motor_control_message.disabled_verified = snapshot.disabled_verified;
+  motor_control_message.verified_joint_mask = control->verified_joint_mask;
+  motor_control_message.pos_vel_supported_mask = control->pos_vel_supported_mask;
+  memcpy(motor_control_message.control_modes, control->control_modes, sizeof(control->control_modes));
+  memcpy(motor_control_message.velocity_limit_max, control->velocity_limit_max, sizeof(control->velocity_limit_max));
+  memcpy(motor_control_message.position_min, control->position_min, sizeof(control->position_min));
+  memcpy(motor_control_message.position_max, control->position_max, sizeof(control->position_max));
+  motor_control_message.switching = control->switching;
+  motor_control_message.operation_id = control->operation_id;
+  motor_control_message.operation_state = control->operation_state;
+  motor_control_message.last_command_sequence = snapshot.last_command_sequence;
+  motor_control_message.mode = snapshot.mode;
+  motor_control_message.fault_code = snapshot.fault_code;
+  motor_control_message.error_code = control->error_code;
+  motor_control_message.rejected_sequence = control->rejected_sequence;
+  motor_control_message.reject_code = control->reject_code;
+  if (rcl_publish(&motor_control_publisher, &motor_control_message, NULL) != RCL_RET_OK)
+    microros_diagnostics.publish_failure_count++;
+}
+
 static void zero_get_callback(const void *message)
 {
   const std_msgs__msg__UInt32 *request = message;
@@ -852,6 +933,11 @@ static void publish_timer_callback(rcl_timer_t *timer, int64_t last_call_time)
   }
   if (rcl_publish(&status_publisher, &status_message, NULL) !=
       RCL_RET_OK) microros_diagnostics.publish_failure_count++;
+
+  if ((uint32_t)(HAL_GetTick() - last_control_publish_ms) >= 50U) {
+    publish_motor_control_status();
+    last_control_publish_ms = HAL_GetTick();
+  }
 
   uint32_t zero_signature = ((uint32_t)zero_snapshot.busy << 31) |
       ((uint32_t)zero_snapshot.result_code << 24) |
@@ -940,6 +1026,10 @@ static bool init_ros_messages(void)
       !sensor_msgs__msg__JointState__init(&zero_state_message) ||
       !microros_stm32h723_bridge__msg__HardwareStatus__init(&status_message) ||
       !microros_stm32h723_bridge__msg__JointCommand__init(&command_message) ||
+      !microros_stm32h723_bridge__msg__JointCommandV2__init(&command_v2_message) ||
+      !microros_stm32h723_bridge__msg__MotorControlStatus__init(&motor_control_message) ||
+      !microros_stm32h723_bridge__srv__MotorControl_Request__init(&motor_control_request) ||
+      !microros_stm32h723_bridge__srv__MotorControl_Response__init(&motor_control_response) ||
       !std_msgs__msg__UInt32__init(&zero_get_message) ||
       !std_msgs__msg__UInt32__init(&zero_set_message) ||
       !std_msgs__msg__UInt32MultiArray__init(&zero_status_message) ||
@@ -975,6 +1065,7 @@ static bool init_ros_messages(void)
            &joint_state_message.header.frame_id, "base_link") &&
          rosidl_runtime_c__String__assign(
            &status_message.header.frame_id, "base_link") &&
+         rosidl_runtime_c__String__assign(&motor_control_message.header.frame_id, "base_link") &&
          rosidl_runtime_c__String__assign(
            &zero_state_message.header.frame_id, "motor_zero_offset");
 }
@@ -1023,10 +1114,13 @@ void StartMicrorosTask(void *argument)
       rcl_get_zero_initialized_subscription();
     rcl_subscription_t zero_set_subscription =
       rcl_get_zero_initialized_subscription();
+    rcl_subscription_t subscription_v2 = rcl_get_zero_initialized_subscription();
+    rcl_service_t motor_service = rcl_get_zero_initialized_service();
     rcl_timer_t timer = rcl_get_zero_initialized_timer();
     rclc_executor_t executor = rclc_executor_get_zero_initialized_executor();
     joint_state_publisher = rcl_get_zero_initialized_publisher();
     status_publisher = rcl_get_zero_initialized_publisher();
+    motor_control_publisher = rcl_get_zero_initialized_publisher();
     zero_state_publisher = rcl_get_zero_initialized_publisher();
     zero_status_publisher = rcl_get_zero_initialized_publisher();
     microros_diagnostics_publisher = rcl_get_zero_initialized_publisher();
@@ -1034,6 +1128,9 @@ void StartMicrorosTask(void *argument)
     bool support_ready = false;
     bool node_ready = false;
     bool subscription_ready = false;
+    bool subscription_v2_ready = false;
+    bool motor_service_ready = false;
+    bool motor_control_publisher_ready = false;
     bool zero_get_subscription_ready = false;
     bool zero_set_subscription_ready = false;
     bool joint_publisher_ready = false;
@@ -1054,6 +1151,18 @@ void StartMicrorosTask(void *argument)
           &subscription, &node,
           ROSIDL_GET_MSG_TYPE_SUPPORT(microros_stm32h723_bridge, msg, JointCommand),
           "/stm32/joint_commands") == RCL_RET_OK;
+      subscription_v2_ready = rclc_subscription_init_best_effort(
+          &subscription_v2, &node,
+          ROSIDL_GET_MSG_TYPE_SUPPORT(microros_stm32h723_bridge, msg, JointCommandV2),
+          "/stm32/joint_commands_v2") == RCL_RET_OK;
+      motor_service_ready = rclc_service_init_default(
+          &motor_service, &node,
+          ROSIDL_GET_SRV_TYPE_SUPPORT(microros_stm32h723_bridge, srv, MotorControl),
+          "/stm32/motor_control") == RCL_RET_OK;
+      motor_control_publisher_ready = rclc_publisher_init_best_effort(
+          &motor_control_publisher, &node,
+          ROSIDL_GET_MSG_TYPE_SUPPORT(microros_stm32h723_bridge, msg, MotorControlStatus),
+          "/stm32/motor_control_status") == RCL_RET_OK;
       zero_get_subscription_ready = rclc_subscription_init_best_effort(
           &zero_get_subscription, &node,
           ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, UInt32),
@@ -1085,15 +1194,20 @@ void StartMicrorosTask(void *argument)
       timer_ready = rclc_timer_init_default(
         &timer, &support, RCL_MS_TO_NS(4U), publish_timer_callback) == RCL_RET_OK;
     }
-    if (subscription_ready && zero_get_subscription_ready &&
+    if (subscription_ready && subscription_v2_ready && motor_service_ready &&
+        motor_control_publisher_ready && zero_get_subscription_ready &&
         zero_set_subscription_ready && joint_publisher_ready &&
         status_publisher_ready && zero_state_publisher_ready &&
         zero_status_publisher_ready && microros_diagnostics_publisher_ready &&
         timer_ready) {
       executor_ready = rclc_executor_init(
-        &executor, &support.context, 4U, &allocator) == RCL_RET_OK;
+        &executor, &support.context, 6U, &allocator) == RCL_RET_OK;
     }
     if (executor_ready &&
+        rclc_executor_add_subscription(&executor, &subscription_v2, &command_v2_message,
+                                       joint_command_v2_callback, ON_NEW_DATA) == RCL_RET_OK &&
+        rclc_executor_add_service(&executor, &motor_service, &motor_control_request,
+                                 &motor_control_response, motor_control_callback) == RCL_RET_OK &&
         rclc_executor_add_subscription(&executor, &subscription, &command_message,
                                        joint_command_callback, ON_NEW_DATA) == RCL_RET_OK &&
         rclc_executor_add_subscription(&executor, &zero_get_subscription,
@@ -1108,6 +1222,7 @@ void StartMicrorosTask(void *argument)
       published_zero_sequence = UINT32_MAX;
       published_zero_signature = UINT32_MAX;
       last_zero_publish_ms = 0U;
+      last_control_publish_ms = 0U;
       last_diagnostics_publish_ms = 0U;
       microros_diagnostics.session_generation++;
       microros_diagnostics.consecutive_ping_failures = 0U;
@@ -1175,6 +1290,9 @@ void StartMicrorosTask(void *argument)
     }
     if (executor_ready) fini_result = rclc_executor_fini(&executor);
     if (timer_ready) fini_result = rcl_timer_fini(&timer);
+    if (subscription_v2_ready) fini_result = rcl_subscription_fini(&subscription_v2, &node);
+    if (motor_service_ready) fini_result = rcl_service_fini(&motor_service, &node);
+    if (motor_control_publisher_ready) fini_result = rcl_publisher_fini(&motor_control_publisher, &node);
     if (subscription_ready) fini_result = rcl_subscription_fini(&subscription, &node);
     if (zero_set_subscription_ready) fini_result = rcl_subscription_fini(&zero_set_subscription, &node);
     if (zero_get_subscription_ready) fini_result = rcl_subscription_fini(&zero_get_subscription, &node);

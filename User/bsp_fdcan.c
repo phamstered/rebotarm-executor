@@ -51,7 +51,7 @@ static void fdcan_queue_push_from_isr(BspFdcanRxQueue *queue,
     queue->head = next;
 }
 
-static uint8_t fdcan_queue_pop(BspFdcanRxQueue *queue, uint16_t *id, uint8_t *buf)
+static uint8_t fdcan_queue_pop(BspFdcanRxQueue *queue, uint16_t *id, uint8_t *buf, uint32_t *received_ms)
 {
     uint8_t tail = queue->tail;
     if (tail == queue->head) {
@@ -62,6 +62,7 @@ static uint8_t fdcan_queue_pop(BspFdcanRxQueue *queue, uint16_t *id, uint8_t *bu
     __DMB();
     queue->tail = (uint8_t)((tail + 1U) % BSP_FDCAN_RX_QUEUE_DEPTH);
     *id = frame.id;
+    if (received_ms) *received_ms = frame.received_ms;
     for (uint8_t i = 0U; i < frame.len; i++) {
         buf[i] = frame.data[i];
     }
@@ -178,7 +179,17 @@ void fdcan1_register_rx_task(TaskHandle_t handle)
 **/
 uint8_t fdcan1_get_rx_data(uint16_t *id, uint8_t *buf)
 {
-	return fdcan_queue_pop(&fdcan1_rx_queue, id, buf);
+	return fdcan_queue_pop(&fdcan1_rx_queue, id, buf, NULL);
+}
+
+uint8_t fdcan1_get_rx_data_at(uint16_t *id, uint8_t *buf, uint32_t *received_ms)
+{
+    return fdcan_queue_pop(&fdcan1_rx_queue, id, buf, received_ms);
+}
+
+bool fdcan1_tx_empty(void)
+{
+    return HAL_FDCAN_GetTxFifoFreeLevel(&hfdcan1) == hfdcan1.Init.TxFifoQueueElmtsNbr;
 }
 
 uint32_t fdcan1_get_rx_overflow_count(void)
@@ -210,7 +221,7 @@ void fdcan2_register_rx_task(TaskHandle_t handle)
 **/
 uint8_t fdcan2_get_rx_data(uint16_t *id, uint8_t *buf)
 {
-	return fdcan_queue_pop(&fdcan2_rx_queue, id, buf);
+	return fdcan_queue_pop(&fdcan2_rx_queue, id, buf, NULL);
 }
 
 uint32_t fdcan2_get_rx_overflow_count(void)
@@ -221,6 +232,7 @@ uint32_t fdcan2_get_rx_overflow_count(void)
 static void fdcan1_rx_callback(void)
 {
 	BspFdcanFrame frame = {0};
+	frame.received_ms = HAL_GetTick();
 	frame.len = fdcanx_receive(&hfdcan1, &frame.id, frame.data);
 	if(frame.len > 0U)
 	{
@@ -238,6 +250,7 @@ static void fdcan1_rx_callback(void)
 static void fdcan2_rx_callback(void)
 {
 	BspFdcanFrame frame = {0};
+	frame.received_ms = HAL_GetTick();
 	frame.len = fdcanx_receive(&hfdcan2, &frame.id, frame.data);
 	if(frame.len > 0U)
 	{
