@@ -8,12 +8,13 @@ static uint32_t clock_ms;
 static BspFdcanFrame sent[128], received[64];
 static unsigned tx_count, rx_count, rx_pos;
 static bool tx_empty = true;
+static bool tick_advancing, fail_send;
 bool fdcan1_tx_empty(void) { return tx_empty; }
-uint32_t HAL_GetTick(void) { return clock_ms; }
+uint32_t HAL_GetTick(void) { return tick_advancing ? clock_ms++ : clock_ms; }
 uint8_t fdcanx_send_data(FDCAN_HandleTypeDef *h, uint16_t id, uint8_t *data, uint32_t len)
 {
     (void)h; assert(tx_count<128 && len==8); sent[tx_count].id=id;
-    memcpy(sent[tx_count++].data,data,8); return 0;
+    memcpy(sent[tx_count++].data,data,8); return fail_send ? 1 : 0;
 }
 uint8_t fdcan1_get_rx_data_at(uint16_t *id, uint8_t *data, uint32_t *received_ms)
 {
@@ -36,6 +37,10 @@ static void fixture(void)
     state.feedback_valid_mask=MV2_ALL; state.control.verified_joint_mask=MV2_ALL;
     for(unsigned i=0;i<7;++i) { state.control.control_modes[i]=1; state.control.position_min[i]=-2; state.control.position_max[i]=2; state.control.velocity_limit_max[i]=1; state.snapshot.last_feedback_ms[i]=100; }
     state.control.pos_vel_supported_mask=1; clock_ms=100;tx_count=rx_count=rx_pos=0;
+    tick_advancing=fail_send=false;
+#if MOTOR_BENCH_JOINT7_POSVEL
+    memset((void *)&motor_bench_diagnostics,0,sizeof(motor_bench_diagnostics));
+#endif
 }
 static MotorBridgeCommand disable(uint32_t sequence)
 {
@@ -109,5 +114,59 @@ int main(void)
     }
     assert(primed); c.sequence=2;
     assert(!motor_bridge_accept_command_v2(&c,201)); assert(state.control.reject_code==MV2_FAULT);
+#if MOTOR_BENCH_JOINT7_POSVEL
+    fixture(); state.snapshot.position[6]=0.5f;
+    /* Ignore a matching RID from the wrong CAN ID, write ACK and wrong motor. */
+    for(unsigned j=0;j<3;++j) {
+        f=&received[rx_count++];memset(f,0,sizeof(*f));f->id=j==0?0x11:0x17;
+        damiao_encode_register_read_cmd(j==2?1:7,13,f->data);
+        if(j==1) f->data[2]=DAMIAO_REG_WRITE_MARKER;
+        f->data[4]=99;
+    }
+    for(unsigned j=0;j<MOTOR_BENCH_REGISTER_COUNT;++j) {
+        f=&received[rx_count++];memset(f,0,sizeof(*f));f->id=0x17;
+        uint8_t rid=motor_bench_registers[j];damiao_encode_register_read_cmd(7,rid,f->data);
+        float value=rid==21?12.5f:rid==22?30.0f:rid==23?10.0f:1.0f;
+        memcpy(f->data+4,&value,4);
+    }
+    initialize_joint7_bench();
+    assert(motor_bench_diagnostics.complete && motor_bench_diagnostics.admitted_mask==0x40);
+    assert(state.control.pos_vel_supported_mask==0x40 && state.control.position_min[0]==0);
+    assert(state.control.position_min[6]==MOTOR_BENCH_POSITION_MIN);
+    for(unsigned j=0;j<tx_count;++j) {
+        assert(sent[j].id==damiao_get_register_can_id());
+        assert(sent[j].data[0]==7 && sent[j].data[2]==DAMIAO_REG_READ_MARKER);
+    }
+    state.drive_status[0]=DAMIAO_STATUS_ENABLED;tx_count=0;
+    initialize_joint7_bench();assert(!state.control.pos_vel_supported_mask && tx_count==0);
+    fixture();state.snapshot.position[6]=0.5f;fail_send=true;
+    initialize_joint7_bench();assert(!state.control.pos_vel_supported_mask);
+    assert(motor_bench_diagnostics.read_mask==0 && motor_bench_diagnostics.errors[0]==DAMIAO_ERR_CAN_WRITE);
+    fixture();state.snapshot.position[6]=0.5f;tick_advancing=true;
+    initialize_joint7_bench();assert(!state.control.pos_vel_supported_mask);
+    assert(motor_bench_diagnostics.read_mask==0 && motor_bench_diagnostics.errors[0]==DAMIAO_ERR_TIMEOUT);
+    assert(clock_ms>=1100 && clock_ms<1600); /* Bounded even with no replies. */
+    for(unsigned reason=1;reason<=5;++reason) {
+        fixture();state.using_v2=true;state.have_command=true;state.snapshot.mode=1;
+        state.command_v2.active_joint_mask=0x40;state.control.lease_id=4;
+        state.control.control_modes[6]=2;state.control.pos_vel_supported_mask=0x40;
+        state.snapshot.position[6]=0.5f;state.received_feedback_ms[6]=100;
+        if(reason==1) state.received_feedback_ms[6]=0;
+        if(reason==2) state.snapshot.velocity[6]=NAN;
+        if(reason==3) state.snapshot.position[6]=0.6f;
+        if(reason==4) state.snapshot.velocity[6]=0.2f;
+        if(reason==5) state.snapshot.effort[6]=0.4f;
+        motor_bridge_control_step(102);
+        assert(state.snapshot.mode==3 && !state.control.lease_id && !state.control.pos_vel_supported_mask);
+        assert(motor_bench_diagnostics.trip_reason==reason && tx_count==7);
+        for(unsigned j=0;j<tx_count;++j) assert(sent[j].data[7]==0xfd);
+        stop=disable(50);assert(motor_bridge_accept_command(&stop,103));
+        assert(state.snapshot.fault_code!=0 && motor_bench_diagnostics.trip_reason==reason);
+        legacy=(MotorBridgeCommand){.sequence=51,.mode=1};
+        assert(!motor_bridge_accept_command(&legacy,104));
+        state.snapshot.velocity[6]=state.snapshot.effort[6]=0;state.snapshot.position[6]=0.5f;
+        motor_bridge_safety_step(105);assert(state.snapshot.mode==3 && state.snapshot.fault_code!=0);
+    }
+#endif
     puts("motor bridge V2 CAN tests passed");
 }
