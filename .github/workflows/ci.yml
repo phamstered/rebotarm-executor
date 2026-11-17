@@ -54,6 +54,14 @@ jobs:
           cc -std=c11 -Wall -Wextra -Werror -Iscripts/host_stubs -IUser scripts/test_motor_bridge_v2.c User/motor_control_v2.c User/damiao_protocol.c -lm -o /tmp/motor-bridge-v2-test
           /tmp/motor-bridge-v2-test
 
+      - name: Joint7 bench guards (no hardware)
+        run: |
+          python3 scripts/test_joint7_bench.py
+          cc -std=c11 -Wall -Wextra -Werror -IUser -DMOTOR_BENCH_JOINT7_POSVEL=1 -DMOTOR_BENCH_POSITION_MIN=0.48f -DMOTOR_BENCH_POSITION_MAX=0.51f -DMOTOR_BENCH_VELOCITY_MAX=0.05f scripts/test_motor_bench.c -o /tmp/motor-bench-test
+          /tmp/motor-bench-test
+          cc -std=c11 -Wall -Wextra -Werror -Iscripts/host_stubs -IUser -DMOTOR_BENCH_JOINT7_POSVEL=1 -DMOTOR_BENCH_POSITION_MIN=0.48f -DMOTOR_BENCH_POSITION_MAX=0.51f -DMOTOR_BENCH_VELOCITY_MAX=0.05f scripts/test_motor_bridge_v2.c User/motor_control_v2.c User/damiao_protocol.c -lm -o /tmp/motor-bridge-bench-test
+          /tmp/motor-bridge-bench-test
+
       - name: Prepare firmware interfaces
         run: python3 scripts/prepare_microros_interfaces.py
 
@@ -97,6 +105,10 @@ jobs:
 
       - name: Firmware size
         run: arm-none-eabi-size build/Debug/rebotarm_executor.elf
+
+      - name: Compile opt-in joint7 bench image (no flash)
+        run: |
+          ./scripts/flash.sh --bench-joint7 --position-min 0.48 --position-max 0.51 --velocity-max 0.05 --build-only
 
       - name: Upload CMake / build logs on failure
         if: failure()

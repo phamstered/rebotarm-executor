@@ -515,3 +515,98 @@ cc -std=c11 -Wall -Wextra -Werror -Iscripts/host_stubs -IUser scripts/test_motor
 cmake --preset Debug && cmake --build build/Debug
 cmake --preset Release && cmake --build build/Release
 ```
+
+### Joint7 bench image
+
+`MOTOR_BENCH_JOINT7_POSVEL` defaults OFF. Production builds still report no
+qualified POS_VEL axes. The opt-in image provides a way to collect the first
+hardware evidence without labeling a model qualified: it can expose **only
+joint7 (mask 0x40, CAN ID 7, feedback ID 0x17, DM4310)**. All other POS entries
+are cleared. Existing DISABLE proof, mode readback, ownership, finite command,
+position/speed admission and watchdog gates remain in force.
+
+Build configuration requires explicit finite decimal `MOTOR_BENCH_POSITION_MIN`,
+`MOTOR_BENCH_POSITION_MAX` and `MOTOR_BENCH_VELOCITY_MAX`, with min < max and
+0 < speed <= 0.05 rad/s. The window must lie inside the feedback encoding range
+[-12.5, 12.5], which is **not a physical travel limit**. Use a dedicated build
+directory; configuring the bench option in production Debug/Release directories
+is rejected. There are no motion defaults or automatic enables.
+
+At startup, after MIT initialization and before command admission, the bench
+image requires disabled feedback from every drive and reads only joint7 RIDs:
+
+| Diagnostic index | RID | Meaning / representation |
+| --- | --- | --- |
+| 0–3 | 13, 14, 15, 36 | hardware version, software version, serial, sub-version; uint32 |
+| 4–7 | 11, 4, 5, 6 | Damp, ACC, DEC, MAX_SPD; float bits |
+| 8–10 | 21, 22, 23 | PMAX, VMAX, TMAX; float bits |
+
+Each read has a 100 ms deadline and must match feedback CAN ID, motor ID, read
+marker and RID. No parameter writes or persistence commands are issued by this
+diagnostic. Any read failure, nonpositive/nonfinite Damp/ACC/DEC/MAX_SPD, MAX_SPD
+below the requested cap, unexpected feedback scaling (must be 12.5/30/10), or
+startup position outside the supplied window leaves support mask 0. These basic
+parameter checks do not qualify the inner-loop tuning or establish torque limits.
+The additional startup delay can be up to 1.1 seconds. Runtime switching stays
+asynchronous. Normal fresh physical DISABLE proof is still required afterwards.
+
+`motor_bench_diagnostics` is a volatile global ELF symbol available to a debugger:
+magic `0x4a374232`, complete, read_mask (`0x7ff` when every read succeeded),
+admitted_mask, configured bounds, startup_position, raw[11], and errors[11].
+Use `arm-none-eabi-nm` to locate it and read it through SWD only while the arm is
+disabled; halting an actively controlled MCU would interrupt its command stream.
+`complete=1` and `admitted_mask=0x40` mean bench prerequisites passed, **not** model
+qualification. Record the actual version/parameter values with test evidence.
+
+During a joint7 V2 motion session only, the bench image also stops on actual
+feedback outside the configured position window plus 0.003 rad tolerance,
+absolute velocity above 0.10 rad/s, absolute reported effort above 0.30 N·m,
+nonfinite feedback, or feedback age over 100 ms (CAN RX timestamp). The control
+and safety paths use the existing lease revocation and all-axis DISABLE, clear
+POS support, and latch `trip_reason`, `trip_ms`, `trip_position`, `trip_velocity`
+and `trip_effort` in the diagnostics. Reasons are 1 stale/invalid, 2 nonfinite,
+3 position, 4 speed, 5 effort. All subsequent motion commands are rejected;
+explicit DISABLE remains available and does not erase the diagnostic. Nothing
+automatically resets the MCU or restarts motion. Investigate the cause before
+an explicit restart/reflash. This is a feedback-triggered stop; it cannot impose
+a drive-internal current/torque ceiling or guarantee zero transient overshoot.
+
+With this bench diagnostic and guard, local linked DTCMRAM use is 122488 bytes
+(Debug) / 122480 bytes (Release), about 93.45% of 128 KiB. This remains a static
+link measurement; task stack high-water marks and allocator headroom still need
+hardware measurement under the intended traffic.
+
+Example **build only**, using an explicitly reviewed local window (never infer
+that these numbers suit a different robot or current position):
+
+```bash
+./scripts/flash.sh --bench-joint7 --position-min 0.48 --position-max 0.51 \
+  --velocity-max 0.05 --build-only
+cmake --preset Release -B build/BenchJoint7Release \
+  -DMOTOR_BENCH_JOINT7_POSVEL=ON -DMOTOR_BENCH_POSITION_MIN=0.48 \
+  -DMOTOR_BENCH_POSITION_MAX=0.51 -DMOTOR_BENCH_VELOCITY_MAX=0.05
+cmake --build build/BenchJoint7Release
+```
+
+Only after reviewing current feedback, travel direction, mechanical clearance,
+probe/MCU/address and on-site safety confirmation, repeat the flash script with
+the same bounds and `--serial <verified-probe>` instead of `--build-only`.
+The repository's existing gripper calibration records raw closed 0.497253418 and
+open -5.308041573 rad. A raw position greater than the closed endpoint must not
+receive a positive trial step; first move only toward the negative/open
+direction and do not automatically return into the closed stop. The example
+window is a transient bench envelope, not a replacement for that calibration.
+
+Suggested evidence sequence: fresh DISABLE; CONFIGURE joint7 and verify readback;
+ACQUIRE; stream current-position TRACK at 20 Hz; a small reviewed opening step;
+HOLD; explicit DISABLE and physical disabled proof; restore MIT and RELEASE.
+Monitor actual position, velocity, effort, feedback age, other-axis enabled bits
+and faults throughout; stop on any breach of the agreed test envelope. POS_VEL
+does not expose a commanded torque cap. Record HOLD/stop/recovery/watchdog and
+RTOS/XRCE measurements before considering any production qualification entry.
+
+The [manufacturer DM4310 manual](https://docs.openarm.dev/assets/files/dm4310-5d089e0b013d8e2fc203c5b670008a66.pdf),
+pages 5–7, defines position in rad, the maximum absolute speed in rad/s, and
+little-endian float commands at motor ID + 0x100; it also requires positive
+internal damping. The bench readout checks that parameter without substituting
+MIT's application Kd. Verify the actual motor revision against the manual.

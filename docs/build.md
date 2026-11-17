@@ -31,6 +31,13 @@ cmake --build build/Debug --target clean
 
 `flash.sh` 写入地址 **`0x08000000`**。烧录前确认目标 MCU、探针与地址；错误目标可能导致变砖或写错芯片。
 
+`--build-only` 只构建，不访问探针；`--serial SERIAL` 可指定已核对的探针。
+`--bench-joint7` 必须同时给出 `--position-min`、`--position-max`、
+`--velocity-max`，刷写时必须指定 `--serial`。台架构建固定使用
+`build/BenchJoint7Debug`，参数在脚本重新配置时显式传入，不依赖旧 CMakeCache。
+默认调用仍构建 `build/Debug`，并显式关闭台架选项。
+窗口只属于本次现场验证，命令例子与只读诊断见[接口文档](./ros2-interface#joint7-bench-image)。
+
 ## 遥测与会话检查
 
 ```bash

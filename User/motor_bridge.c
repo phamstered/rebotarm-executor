@@ -4,6 +4,7 @@
 #include "bsp_fdcan.h"
 #include "damiao_protocol.h"
 #include "motor_capabilities.h"
+#include "motor_bench.h"
 #include "main.h"
 #include "task.h"
 
@@ -99,6 +100,17 @@ typedef struct {
 
 static MotorBridgeState state;
 static DamiaoMotorState motor_state[MOTOR_BRIDGE_JOINT_COUNT];
+#if MOTOR_BENCH_JOINT7_POSVEL
+/* Retained as a global ELF symbol for read-only SWD inspection after startup. */
+volatile MotorBenchDiagnostics motor_bench_diagnostics;
+static uint16_t bench_latched_fault(void)
+{
+    return motor_bench_diagnostics.trip_reason == 1U ? MOTOR_FAULT_FEEDBACK_TIMEOUT :
+        motor_bench_diagnostics.trip_reason ? MOTOR_FAULT_COMMAND_LIMIT : MOTOR_FAULT_NONE;
+}
+#else
+#define bench_latched_fault() MOTOR_FAULT_NONE
+#endif
 
 static bool sequence_is_newer(uint32_t candidate, uint32_t current)
 {
@@ -269,6 +281,47 @@ static DamiaoModeSwitchCtx make_mode_context(uint32_t index)
     return context;
 }
 
+#if MOTOR_BENCH_JOINT7_POSVEL
+static int bench_read_register(uint8_t rid, uint32_t *value, void *context)
+{
+    (void)context;
+    uint8_t data[DAMIAO_DLC];
+    damiao_encode_register_read_cmd(motor_ids[6], rid, data);
+    if (!send_frame(damiao_get_register_can_id(), data)) return DAMIAO_ERR_CAN_WRITE;
+    uint32_t started = HAL_GetTick();
+    while ((uint32_t)(HAL_GetTick() - started) < 100U) {
+        uint16_t can_id;
+        if (protocol_recv(&can_id, data, 5U, NULL) == 0 &&
+            can_id == feedback_ids[6] && damiao_is_register_reply(data) &&
+            data[0] == motor_ids[6] && data[1] == 0U && data[3] == rid) {
+            memcpy(value, data + 4, sizeof(*value));
+            return DAMIAO_ERR_OK;
+        }
+    }
+    return DAMIAO_ERR_TIMEOUT;
+}
+
+static void initialize_joint7_bench(void)
+{
+    MotorBenchDiagnostics diagnostics;
+    state.control.pos_vel_supported_mask = 0U;
+    memset(state.control.position_min, 0, sizeof(state.control.position_min));
+    memset(state.control.position_max, 0, sizeof(state.control.position_max));
+    memset(state.control.velocity_limit_max, 0, sizeof(state.control.velocity_limit_max));
+    bool disabled = true;
+    for (uint32_t i = 0; i < MOTOR_BRIDGE_JOINT_COUNT; ++i)
+        disabled = disabled && state.drive_status[i] == DAMIAO_STATUS_DISABLED;
+    if (motor_bench_collect(&diagnostics, disabled, state.snapshot.position[6],
+                            bench_read_register, NULL)) {
+        state.control.pos_vel_supported_mask = 0x40U;
+        state.control.position_min[6] = MOTOR_BENCH_POSITION_MIN;
+        state.control.position_max[6] = MOTOR_BENCH_POSITION_MAX;
+        state.control.velocity_limit_max[6] = MOTOR_BENCH_VELOCITY_MAX;
+    }
+    motor_bench_diagnostics = diagnostics;
+}
+#endif
+
 static bool read_output_offset(uint32_t index, float *offset)
 {
     uint32_t raw = 0U;
@@ -425,6 +478,11 @@ void motor_bridge_init(void)
             motor_state[i].last_feedback.status_code == DAMIAO_STATUS_ENABLED;
         state.last_feedback_request_ms[i] = HAL_GetTick();
     }
+#if MOTOR_BENCH_JOINT7_POSVEL
+    /* Startup only: no enabled outputs, before admitting any motion. Normal
+     * control-loop register switching remains asynchronous and unchanged. */
+    initialize_joint7_bench();
+#endif
     taskENTER_CRITICAL();
     uint32_t ready_ms = HAL_GetTick();
     for (uint32_t i = 0U; i < MOTOR_BRIDGE_JOINT_COUNT; i++) {
@@ -450,6 +508,7 @@ bool motor_bridge_accept_command(const MotorBridgeCommand *command, uint32_t now
         (uint32_t)(now_ms - state.last_command_ms) > COMMAND_LOSS_LATCH_MS)
         state.communication_loss_latched = true;
     if (!disable && state.communication_loss_latched) fault = MOTOR_FAULT_COMMAND_LOSS_LATCHED;
+    if (!disable && bench_latched_fault()) fault = bench_latched_fault();
     if (fault != MOTOR_FAULT_NONE) {
         /* Wrong-protocol traffic is diagnostic only and cannot disturb its owner. */
         if (fault == MOTOR_FAULT_CONTROL_MODE) {
@@ -471,7 +530,7 @@ bool motor_bridge_accept_command(const MotorBridgeCommand *command, uint32_t now
     state.have_command = true;
     state.last_command_ms = now_ms;
     state.snapshot.last_command_sequence = command->sequence;
-    state.snapshot.fault_code = state.communication_loss_latched ? MOTOR_FAULT_COMMAND_LOSS_LATCHED : MOTOR_FAULT_NONE;
+    state.snapshot.fault_code = state.communication_loss_latched ? MOTOR_FAULT_COMMAND_LOSS_LATCHED : bench_latched_fault();
     set_mode(command->mode);
     taskEXIT_CRITICAL(); return true;
 }
@@ -480,6 +539,7 @@ bool motor_bridge_accept_command_v2(const MotorCommandV2 *command, uint32_t now_
 {
     taskENTER_CRITICAL();
     uint16_t fault = state.communication_loss_latched ? MOTOR_FAULT_COMMAND_LOSS_LATCHED : state.snapshot.fault_code;
+    if (bench_latched_fault()) fault = bench_latched_fault();
     if (!state.initialized || state.zero_snapshot.busy) fault = MOTOR_FAULT_INIT;
     uint16_t error = MV2_OK;
     if (command->mode == MOTOR_MODE_HOLD) {
@@ -512,6 +572,7 @@ MotorControlResponse motor_bridge_control_request(const MotorControlRequest *req
 {
     taskENTER_CRITICAL();
     uint16_t fault = state.communication_loss_latched ? MOTOR_FAULT_COMMAND_LOSS_LATCHED : state.snapshot.fault_code;
+    if (bench_latched_fault()) fault = bench_latched_fault();
     if (!state.initialized || state.zero_snapshot.busy) fault = MOTOR_FAULT_INIT;
     MotorControlResponse response = motor_v2_request(&state.control, request,
         disabled_proven(now_ms), fault, state.snapshot.last_command_sequence, now_ms);
@@ -579,6 +640,30 @@ static void consume_feedback(uint32_t now_ms)
             MOTOR_BRIDGE_ACTIVE_JOINT_MASK;
 }
 
+#if MOTOR_BENCH_JOINT7_POSVEL
+static bool enforce_joint7_bench_feedback(uint32_t now_ms, bool was_active)
+{
+    if (!state.using_v2 || state.command_v2.active_joint_mask != 0x40U ||
+        (!was_active && state.snapshot.mode == MOTOR_MODE_DISABLE)) return false;
+    uint32_t reason = motor_bench_feedback_reason((state.feedback_valid_mask & 0x40U) != 0,
+        now_ms - state.received_feedback_ms[6], state.snapshot.position[6],
+        state.snapshot.velocity[6], state.snapshot.effort[6]);
+    if (!reason) return false;
+    if (!motor_bench_diagnostics.trip_reason) {
+        motor_bench_diagnostics.trip_ms = now_ms;
+        motor_bench_diagnostics.trip_position = state.snapshot.position[6];
+        motor_bench_diagnostics.trip_velocity = state.snapshot.velocity[6];
+        motor_bench_diagnostics.trip_effort = state.snapshot.effort[6];
+        motor_bench_diagnostics.trip_reason = reason;
+    }
+    state.control.pos_vel_supported_mask = 0;
+    state.snapshot.fault_code = bench_latched_fault();
+    set_mode(MOTOR_MODE_DISABLE); /* Revokes the lease through the normal path. */
+    (void)send_disable();
+    return true;
+}
+#endif
+
 static void control_step_locked(uint32_t now_ms)
 {
     uint8_t data[DAMIAO_DLC];
@@ -594,7 +679,13 @@ static void control_step_locked(uint32_t now_ms)
         for (uint32_t i = 0; i < MOTOR_BRIDGE_JOINT_COUNT; ++i)
             state.last_feedback_request_ms[i] = now_ms - DISABLED_FEEDBACK_REQUEST_MS;
     }
+#if MOTOR_BENCH_JOINT7_POSVEL
+    bool bench_was_active = state.snapshot.mode != MOTOR_MODE_DISABLE;
+#endif
     consume_feedback(now_ms);
+#if MOTOR_BENCH_JOINT7_POSVEL
+    if (enforce_joint7_bench_feedback(now_ms, bench_was_active)) return;
+#endif
     if (state.disable_pending || state.disable_tx_wait) return;
     motor_v2_step(&state.control, disabled_proven(now_ms), now_ms, runtime_register_send, NULL);
 
@@ -748,6 +839,14 @@ void motor_bridge_safety_step(uint32_t now_ms)
         taskEXIT_CRITICAL();
         return;
     }
+#if MOTOR_BENCH_JOINT7_POSVEL
+    if (enforce_joint7_bench_feedback(now_ms, false) || bench_latched_fault()) {
+        state.snapshot.fault_code = bench_latched_fault();
+        set_mode(MOTOR_MODE_DISABLE);
+        taskEXIT_CRITICAL();
+        return;
+    }
+#endif
     if (state.zero_snapshot.busy) {
         taskEXIT_CRITICAL();
         return;
