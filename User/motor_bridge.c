@@ -79,6 +79,7 @@ typedef struct {
     uint32_t received_feedback_ms[MOTOR_BRIDGE_JOINT_COUNT];
     bool have_disable;
     bool disable_pending, disable_tx_wait;
+    uint32_t disable_required_mask, disable_remaining_mask;
     MotorBridgeSnapshot snapshot;
     uint32_t last_command_ms;
     bool have_command;
@@ -239,30 +240,81 @@ static bool runtime_register_send(uint8_t axis, bool write, uint32_t value, void
     return send_frame(damiao_get_register_can_id(), data);
 }
 
-static bool send_disable(void)
+static void request_disable(void)
 {
-    bool success = true;
-    uint8_t data[DAMIAO_DLC];
-    damiao_encode_disable_cmd(data);
+    uint32_t required = 0U;
     for (uint32_t i = 0U; i < MOTOR_BRIDGE_JOINT_COUNT; i++) {
-        if (!send_frame(control_can_id(i), data)) {
-            success = false;
-            state.snapshot.fault_code = MOTOR_FAULT_CAN_TX;
-        }
-        if (!state.control.control_modes[i]) {
-            /* Unknown during a failed write: stop both possible CAN channels. */
-            if (!send_frame(damiao_get_pos_vel_can_id(motor_ids[i]), data)) success = false;
-        }
+        if (state.control.control_modes[i] != 2U) required |= 1U << i;
+        if (state.control.control_modes[i] != 1U) required |= 1U << (i + MOTOR_BRIDGE_JOINT_COUNT);
         state.enable_pending[i] = false;
     }
-    return success;
+    if (!state.disable_pending && !state.disable_tx_wait) {
+        state.disable_required_mask = required;
+        state.disable_remaining_mask = required;
+    } else {
+        /* Coalesce repeated stops without replaying the already queued prefix.
+         * A newly unknown mode can only add targets, never remove old targets. */
+        state.disable_remaining_mask |= required & ~state.disable_required_mask;
+        state.disable_required_mask |= required;
+    }
+    if (state.disable_remaining_mask) {
+        state.disable_pending = true;
+        state.disable_tx_wait = false;
+    }
+}
+
+static bool send_disable(void)
+{
+    if (!state.disable_pending) return true;
+    uint8_t data[DAMIAO_DLC];
+    damiao_encode_disable_cmd(data);
+    for (uint32_t bit = 0; bit < 2U * MOTOR_BRIDGE_JOINT_COUNT; ++bit) {
+        uint32_t mask = 1U << bit;
+        if (!(state.disable_remaining_mask & mask)) continue;
+        /* A full FIFO is backpressure, not a failed CAN transmission. */
+        if (fdcan1_tx_free() == 0U) return false;
+        uint32_t axis = bit % MOTOR_BRIDGE_JOINT_COUNT;
+        uint16_t can_id = bit < MOTOR_BRIDGE_JOINT_COUNT ?
+            damiao_get_mit_can_id(motor_ids[axis]) : damiao_get_pos_vel_can_id(motor_ids[axis]);
+        if (!send_frame(can_id, data)) {
+            state.snapshot.fault_code = MOTOR_FAULT_CAN_TX;
+            return false;
+        }
+        state.disable_remaining_mask &= ~mask;
+    }
+    state.disable_pending = false;
+    state.disable_tx_wait = true;
+    return true;
+}
+
+static bool initialize_disabled_outputs(uint32_t timeout_ms)
+{
+    /* Startup only, before command admission, outside any critical section.
+     * Leave runtime flushing to the nonblocking 4 ms control steps. */
+    uint32_t start = HAL_GetTick();
+    request_disable();
+    while (state.disable_pending || state.disable_tx_wait) {
+        if (state.disable_pending) (void)send_disable();
+        if (state.snapshot.fault_code == MOTOR_FAULT_CAN_TX) return false;
+        if (!state.disable_pending && fdcan1_tx_empty()) {
+            state.disable_tx_wait = false;
+            state.disable_ms = HAL_GetTick();
+            return true;
+        }
+        if ((uint32_t)(HAL_GetTick() - start) >= timeout_ms) {
+            state.snapshot.fault_code = MOTOR_FAULT_CAN_TX;
+            return false;
+        }
+        vTaskDelay(pdMS_TO_TICKS(1U));
+    }
+    return true;
 }
 
 static void set_mode(uint8_t mode)
 {
     if (mode == MOTOR_MODE_DISABLE) motor_v2_disable(&state.control);
     if (state.snapshot.mode != mode) {
-        if (mode == MOTOR_MODE_DISABLE) state.disable_pending = true;
+        if (mode == MOTOR_MODE_DISABLE) request_disable();
         state.snapshot.mode = mode;
         state.hold_latched = false;
     }
@@ -452,7 +504,7 @@ void motor_bridge_init(void)
     }
     state.snapshot.mode = MOTOR_MODE_DISABLE;
     state.snapshot.active_joint_mask = MOTOR_BRIDGE_ACTIVE_JOINT_MASK;
-    send_disable();
+    if (!initialize_disabled_outputs(100U)) return;
 
     for (uint32_t i = 0U; i < MOTOR_BRIDGE_JOINT_COUNT; i++) {
         damiao_motor_state_init(&motor_state[i], motor_ids[i], feedback_ids[i],
@@ -463,7 +515,8 @@ void motor_bridge_init(void)
             damiao_ensure_control_mode(&mode_ctx, DAMIAO_MODE_MIT, 300U) !=
                 DAMIAO_ERR_OK) {
             state.snapshot.fault_code = MOTOR_FAULT_INIT;
-            send_disable();
+            request_disable();
+            (void)send_disable();
             return;
         }
         state.control.control_modes[i] = 1U;
@@ -524,7 +577,7 @@ bool motor_bridge_accept_command(const MotorBridgeCommand *command, uint32_t now
         state.command.mode = MOTOR_MODE_DISABLE;
         state.disable_ms = now_ms;
         state.have_disable = true;
-        state.disable_pending = true;
+        request_disable();
         motor_v2_disable(&state.control);
     } else { state.using_v2 = false; state.have_disable = false; }
     state.have_command = true;
@@ -576,7 +629,10 @@ MotorControlResponse motor_bridge_control_request(const MotorControlRequest *req
     if (!state.initialized || state.zero_snapshot.busy) fault = MOTOR_FAULT_INIT;
     MotorControlResponse response = motor_v2_request(&state.control, request,
         disabled_proven(now_ms), fault, state.snapshot.last_command_sequence, now_ms);
-    if (response.accepted && request->action == 4U) set_mode(MOTOR_MODE_DISABLE);
+    if (response.accepted && request->action == 4U) {
+        request_disable();
+        set_mode(MOTOR_MODE_DISABLE);
+    }
     taskEXIT_CRITICAL(); return response;
 }
 
@@ -667,10 +723,7 @@ static bool enforce_joint7_bench_feedback(uint32_t now_ms, bool was_active)
 static void control_step_locked(uint32_t now_ms)
 {
     uint8_t data[DAMIAO_DLC];
-    if (state.disable_pending && send_disable()) {
-        state.disable_pending = false;
-        state.disable_tx_wait = true;
-    }
+    if (state.disable_pending) (void)send_disable();
     /* Wait for actual CAN transmission before requesting post-stop feedback.
      * This is a nonblocking FIFO query, never a busy wait in the 4 ms loop. */
     if (state.disable_tx_wait && fdcan1_tx_empty()) {
@@ -697,6 +750,7 @@ static void control_step_locked(uint32_t now_ms)
             damiao_encode_feedback_request_cmd(motor_ids[i], data);
             if (!send_frame(damiao_get_register_can_id(), data)) {
                 state.snapshot.fault_code = MOTOR_FAULT_CAN_TX;
+                request_disable();
                 set_mode(MOTOR_MODE_DISABLE);
                 return;
             }
@@ -705,13 +759,11 @@ static void control_step_locked(uint32_t now_ms)
     }
 
     if (state.snapshot.mode == MOTOR_MODE_DISABLE || !state.have_command) {
+        if (any_motor_enabled()) {
+            request_disable();
+            (void)send_disable();
+        }
         for (uint32_t i = 0U; i < MOTOR_BRIDGE_JOINT_COUNT; i++) {
-            if (state.motor_enabled[i]) {
-                damiao_encode_disable_cmd(data);
-                if (!send_frame(control_can_id(i), data)) state.snapshot.fault_code = MOTOR_FAULT_CAN_TX;
-                if (!state.control.control_modes[i])
-                    (void)send_frame(damiao_get_pos_vel_can_id(motor_ids[i]), data);
-            }
             state.enable_pending[i] = false;
         }
         return;
@@ -745,9 +797,11 @@ static void control_step_locked(uint32_t now_ms)
     for (uint32_t i = 0U; i < MOTOR_BRIDGE_JOINT_COUNT; i++) {
         if (!(selected & (1U << i))) {
             if (state.motor_enabled[i]) {
-                damiao_encode_disable_cmd(data);
-                (void)send_frame(control_can_id(i), data);
-                all_enabled = false;
+                /* Unexpected output on an unselected axis stops the whole
+                 * transaction; use the same FIFO-aware unknown-mode queue. */
+                set_mode(MOTOR_MODE_DISABLE);
+                (void)send_disable();
+                return;
             }
             state.enable_pending[i] = false;
             continue;
@@ -934,6 +988,7 @@ void motor_bridge_force_disable(uint16_t fault_code)
 {
     taskENTER_CRITICAL();
     state.snapshot.fault_code = fault_code;
+    request_disable();
     set_mode(MOTOR_MODE_DISABLE);
     taskEXIT_CRITICAL();
 }

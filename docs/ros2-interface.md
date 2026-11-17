@@ -407,6 +407,21 @@ never recreates an expired lease.
    drives even if the previous feedback still said disabled while enable was
    pending. A non-DISABLE accepted command invalidates the stop proof. ACQUIRE
    alone keeps `disabled_verified` true until its first motion frame.
+   The FDCAN1 TX FIFO has eight slots, while seven unknown drive modes require
+   fourteen STOP frames (both MIT and POS_VEL CAN IDs). A persistent pending
+   bitmap drains only into currently available slots; FIFO saturation defers
+   remaining frames without declaring a CAN fault or resending the completed
+   prefix. Repeated DISABLE requests coalesce into the in-flight stop; new
+   unknown-mode targets can only add to that set. Proof remains false until
+   every required STOP has been queued, the hardware FIFO is empty, and all
+   drives provide newer disabled feedback. A genuine enqueue error still reports
+   fault 8 and preserves the unqueued targets for the next step. Startup waits
+   outside a critical section for at most 100 ms for the initial STOP set to
+   transmit before requesting any drive feedback/registers. Timeout leaves
+   initialization incomplete and motion prohibited; runtime control steps can
+   continue flushing STOP. Runtime flushing never sleeps or waits. Unexpected
+   enabled feedback from an unselected axis stops the entire transaction through
+   this same queue instead of issuing untracked individual STOP frames.
 2. CONFIGURE (action 1) supplies the current boot/epoch, source, nonempty selected
    mask, desired control mode (MIT 1 or POS_VEL 2), and the exact latest accepted
    DISABLE sequence. It returns admission only. A stopped new source can take
@@ -498,8 +513,8 @@ RTOS heap reservation):
 
 | Build | DTCMRAM / 128 KiB | RAM_D2 / 32 KiB | FLASH / 1 MiB |
 | --- | --- | --- | --- |
-| Debug | 122344 B (93.34%) | 26720 B (81.54%) | 176212 B |
-| Release | 122336 B (93.33%) | 26720 B (81.54%) | 137440 B |
+| Debug | 122352 B (93.35%) | 26720 B (81.54%) | 176628 B |
+| Release | 122344 B (93.34%) | 26720 B (81.54%) | 137672 B |
 
 DTCMRAM headroom is limited; a successful link does not establish runtime stack
 or heap headroom. Measure task stack high-water marks and allocator free/minimum
@@ -571,8 +586,8 @@ automatically resets the MCU or restarts motion. Investigate the cause before
 an explicit restart/reflash. This is a feedback-triggered stop; it cannot impose
 a drive-internal current/torque ceiling or guarantee zero transient overshoot.
 
-With this bench diagnostic and guard, local linked DTCMRAM use is 122488 bytes
-(Debug) / 122480 bytes (Release), about 93.45% of 128 KiB. This remains a static
+With this bench diagnostic, guard and queued STOP bookkeeping, local linked DTCMRAM use is 122496 bytes
+(Debug) / 122488 bytes (Release), about 93.46% of 128 KiB. This remains a static
 link measurement; task stack high-water marks and allocator headroom still need
 hardware measurement under the intended traffic.
 

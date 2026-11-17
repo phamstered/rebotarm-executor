@@ -25,6 +25,7 @@ void fdcan1_register_rx_task(TaskHandle_t handle);
 uint8_t fdcan1_get_rx_data(uint16_t *id, uint8_t *buf);
 uint8_t fdcan1_get_rx_data_at(uint16_t *id, uint8_t *buf, uint32_t *received_ms);
 bool fdcan1_tx_empty(void);
+uint32_t fdcan1_tx_free(void);
 uint32_t fdcan1_get_rx_overflow_count(void);
 
 /* FDCAN2 接收接口 */

@@ -189,7 +189,15 @@ uint8_t fdcan1_get_rx_data_at(uint16_t *id, uint8_t *buf, uint32_t *received_ms)
 
 bool fdcan1_tx_empty(void)
 {
-    return HAL_FDCAN_GetTxFifoFreeLevel(&hfdcan1) == hfdcan1.Init.TxFifoQueueElmtsNbr;
+    /* No queued slots and no outstanding transmit request, including the last
+     * frame that may still be arbitrating/transmitting on the wire. */
+    return HAL_FDCAN_GetTxFifoFreeLevel(&hfdcan1) == hfdcan1.Init.TxFifoQueueElmtsNbr &&
+        hfdcan1.Instance->TXBRP == 0U;
+}
+
+uint32_t fdcan1_tx_free(void)
+{
+    return HAL_FDCAN_GetTxFifoFreeLevel(&hfdcan1);
 }
 
 uint32_t fdcan1_get_rx_overflow_count(void)
