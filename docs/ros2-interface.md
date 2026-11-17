@@ -555,21 +555,35 @@ image requires disabled feedback from every drive and reads only joint7 RIDs:
 | 0–3 | 13, 14, 15, 36 | hardware version, software version, serial, sub-version; uint32 |
 | 4–7 | 11, 4, 5, 6 | Damp, ACC, DEC, MAX_SPD; float bits |
 | 8–10 | 21, 22, 23 | PMAX, VMAX, TMAX; float bits |
+| 11 | 31 | Deta, speed-loop damping factor; float bits |
 
 Each read has a 100 ms deadline and must match feedback CAN ID, motor ID, read
 marker and RID. No parameter writes or persistence commands are issued by this
-diagnostic. Any read failure, nonpositive/nonfinite Damp/ACC/DEC/MAX_SPD, MAX_SPD
-below the requested cap, unexpected feedback scaling (must be 12.5/30/10), or
-startup position outside the supplied window leaves support mask 0. These basic
-parameter checks do not qualify the inner-loop tuning or establish torque limits.
-The additional startup delay can be up to 1.1 seconds. Runtime switching stays
+diagnostic. Any read failure, nonfinite or nonpositive ACC/MAX_SPD, nonfinite or
+nonnegative DEC, Deta outside the finite range [1, 30], unexpected feedback
+scaling (must be 12.5/30/10), or startup position outside the supplied window
+leaves support mask 0. Damp is the physical viscous coefficient, **not** the
+speed-loop damping factor: its existing finite-positive check is retained as
+an additional conservative data check, and never substitutes for reading Deta.
+MAX_SPD describes the motor before the gearbox; it is not compared directly
+with the output-shaft POS_VEL command cap. The explicit command cap still
+remains at or below 0.05 rad/s. These basic parameter checks do not qualify the
+inner-loop tuning or establish torque limits.
+The additional startup delay can be up to 1.2 seconds. Runtime switching stays
 asynchronous. Normal fresh physical DISABLE proof is still required afterwards.
 
 `motor_bench_diagnostics` is a volatile global ELF symbol available to a debugger:
-magic `0x4a374232`, complete, read_mask (`0x7ff` when every read succeeded),
-admitted_mask, configured bounds, startup_position, raw[11], and errors[11].
+magic `0x4a374233` (J7B3), complete, read_mask (`0xfff` when every read succeeded),
+admitted_mask, configured bounds, startup_position, raw[12], and errors[12].
+The layout is 148 bytes, little-endian Python format `<4I4f12I12i2I3f`:
+raw starts at byte 32, errors at 80, trip_reason at 128, trip_ms at 132,
+and trip_position/velocity/effort at 136/140/144. It differs from the previous
+140-byte J7B2 layout; never decode one with the other's offsets.
 Use `arm-none-eabi-nm` to locate it and read it through SWD only while the arm is
 disabled; halting an actively controlled MCU would interrupt its command stream.
+Decode an already captured dump with
+`python3 scripts/decode_joint7_bench.py /path/to/joint7-diagnostics.bin`.
+The decoder rejects other lengths/magic and never accesses hardware.
 `complete=1` and `admitted_mask=0x40` mean bench prerequisites passed, **not** model
 qualification. Record the actual version/parameter values with test evidence.
 
@@ -586,8 +600,8 @@ automatically resets the MCU or restarts motion. Investigate the cause before
 an explicit restart/reflash. This is a feedback-triggered stop; it cannot impose
 a drive-internal current/torque ceiling or guarantee zero transient overshoot.
 
-With this bench diagnostic, guard and queued STOP bookkeeping, local linked DTCMRAM use is 122496 bytes
-(Debug) / 122488 bytes (Release), about 93.46% of 128 KiB. This remains a static
+With this bench diagnostic, guard and queued STOP bookkeeping, local linked DTCMRAM use is 122504 bytes
+(Debug) / 122496 bytes (Release), about 93.46% of 128 KiB. This remains a static
 link measurement; task stack high-water marks and allocator headroom still need
 hardware measurement under the intended traffic.
 
@@ -623,5 +637,12 @@ RTOS/XRCE measurements before considering any production qualification entry.
 The [manufacturer DM4310 manual](https://docs.openarm.dev/assets/files/dm4310-5d089e0b013d8e2fc203c5b670008a66.pdf),
 pages 5–7, defines position in rad, the maximum absolute speed in rad/s, and
 little-endian float commands at motor ID + 0x100; it also requires positive
-internal damping. The bench readout checks that parameter without substituting
-MIT's application Kd. Verify the actual motor revision against the manual.
+internal damping. The manufacturer's [DM-J4310-2EC V1.1 manual V1.3 (2026-09-14)](https://github.com/dmBots/DM-J4310-2EC/blob/master/manual/DM-J4310-2EC%20V1.1%20%E5%87%8F%E9%80%9F%E7%94%B5%E6%9C%BA%E4%BD%BF%E7%94%A8%E8%AF%B4%E6%98%8E%E4%B9%A6%20V1.3%202026-09-14.pdf),
+pages 18–19, specifies negative DEC, physical Damp at RID 11, and speed-loop
+Deta at RID 31 with an allowed range [1, 30]. The [manufacturer's common drive
+protocol V1.4](https://gitee.com/kit-miao/damiao-document/blob/master/%E8%B0%83%E8%AF%95%E5%8A%A9%E6%89%8B%E4%BD%BF%E7%94%A8%E8%AF%B4%E6%98%8E%E4%B9%A6%EF%BC%88%E8%BE%BE%E5%A6%99%E9%A9%B1%E5%8A%A8%E6%8E%A7%E5%88%B6%E5%8D%8F%E8%AE%AE%EF%BC%89V1.4.pdf),
+pages 39–40, distinguishes physical viscosity from the speed-loop damping
+factor and describes MAX_SPD before the gearbox. Its suggested damping range
+2.5–20 (default 4) is tuning guidance, distinct from the register's allowed
+range. The bench readout independently checks Deta, without substituting Damp
+or MIT's application Kd. Verify the actual motor revision against the manual.
