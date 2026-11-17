@@ -47,6 +47,16 @@ jobs:
           cc -std=c11 -Wall -Wextra -Werror -ICore/Inc scripts/test_clock_sync.c -o /tmp/clock-sync-test
           /tmp/clock-sync-test
 
+      - name: Motor control V2 host tests
+        run: |
+          cc -std=c11 -Wall -Wextra -Werror -IUser scripts/test_motor_control_v2.c User/motor_control_v2.c -o /tmp/motor-v2-test
+          /tmp/motor-v2-test
+          cc -std=c11 -Wall -Wextra -Werror -Iscripts/host_stubs -IUser scripts/test_motor_bridge_v2.c User/motor_control_v2.c User/damiao_protocol.c -lm -o /tmp/motor-bridge-v2-test
+          /tmp/motor-bridge-v2-test
+
+      - name: Prepare firmware interfaces
+        run: python3 scripts/prepare_microros_interfaces.py
+
       - name: Verify toolchain
         run: arm-none-eabi-gcc --version
 
@@ -58,7 +68,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: micro_ros_stm32cubemx_utils/microros_static_library/libmicroros
-          key: libmicroros-${{ runner.os }}-${{ hashFiles('micro_ros_stm32cubemx_utils/microros_static_library/library_generation/**', 'Makefile') }}
+          key: libmicroros-${{ runner.os }}-${{ hashFiles('interfaces/**', 'micro_ros_stm32cubemx_utils/microros_static_library/library_generation/**', 'Makefile') }}
           restore-keys: |
             libmicroros-${{ runner.os }}-
 

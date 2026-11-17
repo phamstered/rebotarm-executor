@@ -48,7 +48,7 @@ float32[7] effort
 - `header` 当前不参与固件校验；安全超时使用 STM32 单调时钟。
 - `sequence` 必须按 uint32 回绕规则严格递增，重复或旧序号被拒绝。
 - `position` 单位 rad，`velocity` 单位 rad/s，`effort` 单位 Nm；数组按本文关节顺序排列。
-- 所有数值必须有限；应用层要求 `kp >= 0`、`kd >= 0`、`|effort| <= 10 Nm`，
+- 非 DISABLE 命令所有数值必须有限；应用层要求 `kp >= 0`、`kd >= 0`、`|effort| <= 10 Nm`，
   不再为 kp/kd 设置额外的上限。这里的 effort 限制是独立的应用层安全策略。
 - 电机 MIT 协议本身的增益量程仍为 `0 <= kp <= 500`、`0 <= kd <= 5`。
   超出协议量程的增益在报文编码时会钳制；例如命令 `kd=6` 实际编码为 `kd=5`。
@@ -75,7 +75,7 @@ MIT 报文只传输归一化后的 16/12-bit 整数，不携带上述量程。�
 | 3 | `DISABLE` | 向所有电机发送 DISABLE；其余数组字段不产生驱动输出。 |
 
 TRACK 命令超过 100 ms 未更新时进入 HOLD；超过 500 ms 锁存通信丢失故障并
-拒绝后续命令。锁存后需要安全回零并重启才能恢复，不能通过 Agent 重连解除。
+拒绝后续运动命令；新序号的 DISABLE 始终可用。锁存后需要安全回零并重启才能恢复，不能通过 Agent 重连解除。
 零点维护执行期间普通 JointCommand 也会被拒绝。
 
 ## CAN 控制周期与总线负载
@@ -210,14 +210,14 @@ Host 必须在会话内按桥接频率 **持续发送** `JointCommand`（与正�
 | 常量（固件） | 值 | 行为 |
 |---|---:|---|
 | `COMMAND_TIMEOUT_MS` | 100 | 处于 TRACK 且距上一帧合法命令超过此时长 → **进入 HOLD**（不置故障码） |
-| `COMMAND_LOSS_LATCH_MS` | 500 | 非 DISABLE 且距上一帧合法命令超过此时长 → 锁存 `fault_code = 11`，若电机已使能则 **HOLD**，否则 DISABLE；之后拒绝新命令，需安全回零并重启恢复 |
+| `COMMAND_LOSS_LATCH_MS` | 500 | 非 DISABLE 且距上一帧合法命令超过此时长 → 锁存 `fault_code = 11`，若电机已使能则 **HOLD**，否则 DISABLE；之后拒绝新运动命令（仍接受 DISABLE），需安全回零并重启恢复 |
 
 命令丢失后的固件行为摘要：
 
 1. 锁存 `MOTOR_FAULT_COMMAND_LOSS_LATCHED`（11）
 2. 关节进入 **HOLD**（保持最后锁存/安全位置；HOLD 下 effort=0）——**不是**会话 abort 时的首选 DISABLE
 3. `HardwareStatus.mode` 反映 HOLD（或未使能时的 DISABLE）
-4. Host 读到 fault 11 → action ABORTING → 若链路仍通可继续发 HOLD；否则引导现有 `safe_stop`
+4. Host 读到 fault 11 → action ABORTING → 固件已锁存 HOLD；若链路仍通可发 DISABLE，新 HOLD 仍会被拒绝
 
 反馈超时（fault 6）等路径仍可强制 DISABLE；那是硬件保护，与「辨识 abort → HOLD」的 host 契约分开。
 
@@ -359,3 +359,143 @@ USB CDC 使用异步传输。micro-ROS `write()` 将完整字节流复制到 RAM
 
 同步失效仍发布反馈，但三类带时间戳消息（JointState、HardwareStatus、零位状态）
 显式清零 stamp，避免残留上次值。诊断 1 Hz，关节/硬件目标频率仍为 250 Hz。
+
+## POS_VEL V2 control and runtime configuration
+
+`JointCommand` and `HardwareStatus` keep their existing ABI. V1 non-DISABLE
+commands are MIT-only: they are admitted only when all seven modes have verified
+MIT readback, no configuration is pending, and no V2 owner remains. V1 mode 3
+is the global stop for either protocol; its sequence must be newer than the last
+accepted V1 **or** V2 sequence (32-bit wrap comparison). Its control arrays are
+ignored and cleared, so DISABLE remains available even with invalid stale gain
+values or latched fault 11. DISABLE does not clear fault 11.
+
+New endpoints (fixed-size arrays use the existing joint order):
+
+| Endpoint | Type | QoS / cadence |
+| --- | --- | --- |
+| `/stm32/joint_commands_v2` | `microros_stm32h723_bridge/msg/JointCommandV2` | best effort, keep last, expected 20 Hz |
+| `/stm32/motor_control_status` | `microros_stm32h723_bridge/msg/MotorControlStatus` | best effort, 20 Hz |
+| `/stm32/motor_control` | `microros_stm32h723_bridge/srv/MotorControl` | reliable service, nonblocking admission |
+
+The versioned message/service definitions live in `interfaces/`. Before building
+`libmicroros.a`, run `python3 scripts/prepare_microros_interfaces.py`; this overlays
+the definitions into the initialized micro-ROS submodule. Regenerate the static
+library with the existing Docker command after an interface change. Do not reuse
+an older generated library. CI keys its cache on these versioned inputs.
+
+### Admission and configuration
+
+`boot_id` is two hardware RNG words sampled once per firmware boot. A clock/seed
+error yields zero and disables V2 admission; MIT remains available. The RNG v3.2
+conditioning reset follows [ST's HAL sequence](https://github.com/STMicroelectronics/stm32h7xx-hal-driver/blob/master/Src/stm32h7xx_hal_rng.c). Desktop JSON
+must represent this 64-bit value and `source_id` as decimal strings. The Bridge
+assigns each connection its `source_id` and incrementing nonzero `operation_id`.
+Repeated identical service requests are idempotent; changing a request under the
+same operation ID or replaying an older operation is rejected. A cached ACQUIRE
+never recreates an expired lease.
+
+1. Send a fresh V1 DISABLE and wait for status mode 3, no enabled axes, no lease
+   and no pending operation. Firmware independently requires all seven drives'
+   finite DISABLED feedback to be received strictly after its CAN DISABLE frames
+   finish transmitting, with age at most 100 ms. `disabled_verified` publishes
+   this proof: enqueueing stop frames, a zero enabled mask, and a newer status
+   stamp alone do not prove a stop. The control task polls TX FIFO completion
+   without blocking, then requests feedback; RX timestamps originate in the
+   FDCAN interrupt, so previously queued feedback cannot fabricate freshness. The local act of sending CAN DISABLE does **not** set the
+   reported enabled mask to zero. Every explicit DISABLE sends stop to all seven
+   drives even if the previous feedback still said disabled while enable was
+   pending. A non-DISABLE accepted command invalidates the stop proof. ACQUIRE
+   alone keeps `disabled_verified` true until its first motion frame.
+2. CONFIGURE (action 1) supplies the current boot/epoch, source, nonempty selected
+   mask, desired control mode (MIT 1 or POS_VEL 2), and the exact latest accepted
+   DISABLE sequence. It returns admission only. A stopped new source can take
+   over an abandoned owner by CONFIGURE once no lease or switch is active.
+3. The 4 ms control task enqueues at most one register request per step. For each
+   selected axis, it writes register 10, waits for the matching write reply,
+   settles for 20 ms, reads back, and checks the actual value. Matching requires
+   feedback CAN ID, motor ID, register and transaction phase. Write/read waits
+   time out after 100 ms. No runtime register operation sleeps or waits in the
+   control task. A write immediately marks that axis's actual mode unknown and
+   unverified; only matching readback restores verification.
+4. Observe matching `operation_id`, `OP_SUCCESS` and a new `control_epoch` before
+   proceeding. Failure/cancellation also advances the epoch, leaves the drives
+   disabled, revokes the lease, and reports a terminal state. Partial success is
+   visible per axis; it must not be interpreted as a complete switch.
+5. ACQUIRE (action 2) requires the same fresh disabled proof, verified POS_VEL on
+   the selected supported axes and no faults. It grants a new lease. The first
+   and subsequent V2 frame must arrive within 100 ms of the grant/last accepted
+   frame. RELEASE (action 3) requires disabled proof and verified MIT on **all**
+   axes; it clears ownership so legacy controllers can resume. CANCEL (action 4)
+   revokes the lease, cancels configuration and requests DISABLE. Any V1 DISABLE
+   also cancels an in-flight configuration. Fault 11 is never cleared by these
+   actions; recovery still requires the existing reset procedure. Accepted ACQUIRE
+   and RELEASE publish their own operation ID with SUCCESS immediately; CANCEL
+   publishes its operation ID with CANCELLED. These do not advance the epoch
+   unless they terminate an in-flight configuration.
+
+### Motion, status and watchdogs
+
+V2 supplies `boot_id`, `control_epoch`, `source_id`, `lease_id`, a shared monotonic
+`sequence`, `control_mode=2`, `mode` HOLD 0 or TRACK 1, the exact acquired mask,
+`position[7]`, and `velocity_limit[7]`. Unselected entries must be zero. All values
+must be finite; selected speed limits must be positive and within the qualified
+axis capability. TRACK targets must be inside its qualified position range.
+HOLD position entries must be zero: these are placeholders, not movement targets;
+its fresh measured position must be within the qualified range before admission
+and again before latching the hold. There
+are no MIT gains or effort fields. RETURN is rejected in V2.
+
+Only selected axes are enabled, through their verified control mode CAN ID.
+Unselected axes remain disabled. POS_VEL targets are emitted with the existing
+8-byte float encoder at CAN ID `motor_id + 0x100`; receipt never changes a drive's
+mode. Before enabling, the admitted POS target is loaded to replace any old drive target.
+HOLD latches the fresh measured position once and keeps the positive
+requested speed limit. The periodic transport remains necessary: at >100 ms
+without an accepted command, TRACK becomes HOLD and its lease is revoked; at
+>500 ms fault 11 latches. As in V1, enabled drives remain in HOLD under fault 11
+until explicit DISABLE; already disabled drives stay disabled. Feedback timeout,
+drive error or CAN failure requests DISABLE and revokes V2 admission. Neither
+late frames nor delayed ACQUIRE replies restart a revoked lease.
+
+`MotorControlStatus` publishes actual per-axis modes, readback verification mask,
+qualified support and limits, enabled mask from received feedback, current
+`disabled_verified` proof, owner/lease,
+configuration operation state, last accepted sequence, mode and fault. Rejected
+V2 frames report `rejected_sequence` and `reject_code` without replacing the active
+command or latching a hardware fault; a later accepted V2 frame clears the reject
+code. V1 motion rejected during V2 ownership similarly reports MODE. Status may
+retain an old rejected sequence when its code has cleared.
+
+Service/status error codes: 0 NONE, 1 INVALID, 2 STALE_IDENTITY, 3 NOT_DISABLED,
+4 BUSY, 5 UNSUPPORTED, 6 MODE, 7 LEASE, 8 SEQUENCE, 9 NONFINITE, 10 LIMITS,
+11 FAULT, 12 READBACK, 13 TIMEOUT. Operation states: 0 IDLE, 1 PENDING,
+2 SUCCESS, 3 FAILURE, 4 CANCELLED. Legacy fault codes retain their numbering;
+code 13 CONTROL_MODE is reserved for V1 protocol mismatch, exposed as the V2
+MODE rejection rather than interrupting the current owner.
+
+### Qualification and verification boundary
+
+`User/motor_capabilities.h` is deliberately unqualified: the reported POS_VEL
+support mask is **0** and all POS limits are zero. DM4340P/DM4310 register mode,
+reply format, positive speed-limit semantics, model/firmware range, HOLD, stop,
+watchdog and recovery must be bench-qualified before enabling a table entry.
+MIT integer encoding ranges are not used as POS_VEL capability claims. This
+release implements the complete switching, admission and CAN path, exercised by
+host simulation with a qualified mask; it does not claim hardware qualification.
+
+The micro-ROS pools remain 10 publishers / 5 subscriptions / 1 service / 1 client;
+the application uses 6 / 4 / 1 / 0, with six executor handles. Static messages avoid
+per-frame allocations. Debug/Release cross-compilation and host tests do not prove
+250 Hz timing, RTOS stack high-water marks, XRCE delivery or motor behavior on a
+board; those remain bench checks before enabling POS support. No firmware flash
+or motor motion is required for the following tests:
+
+```sh
+cc -std=c11 -Wall -Wextra -Werror -IUser scripts/test_motor_control_v2.c User/motor_control_v2.c -o /tmp/motor-v2-test
+/tmp/motor-v2-test
+cc -std=c11 -Wall -Wextra -Werror -Iscripts/host_stubs -IUser scripts/test_motor_bridge_v2.c User/motor_control_v2.c User/damiao_protocol.c -lm -o /tmp/motor-bridge-v2-test
+/tmp/motor-bridge-v2-test
+cmake --preset Debug && cmake --build build/Debug
+cmake --preset Release && cmake --build build/Release
+```
