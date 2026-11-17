@@ -423,9 +423,12 @@ never recreates an expired lease.
    disabled, revokes the lease, and reports a terminal state. Partial success is
    visible per axis; it must not be interpreted as a complete switch.
 5. ACQUIRE (action 2) requires the same fresh disabled proof, verified POS_VEL on
-   the selected supported axes and no faults. It grants a new lease. The first
-   and subsequent V2 frame must arrive within 100 ms of the grant/last accepted
-   frame. RELEASE (action 3) requires disabled proof and verified MIT on **all**
+   the selected supported axes and no faults. It grants a new lease. While outputs
+   remain DISABLE, the first accepted V2 frame must arrive within
+   500 ms of the grant. After that first frame, each accepted frame must arrive
+   within 100 ms of the previous one (including HOLD). The longer first-frame
+   window only accommodates service/status/desktop handshake; it does not send
+   targets or enable drives, and DISABLE still revokes it immediately. RELEASE (action 3) requires disabled proof and verified MIT on **all**
    axes; it clears ownership so legacy controllers can resume. CANCEL (action 4)
    revokes the lease, cancels configuration and requests DISABLE. Any V1 DISABLE
    also cancels an in-flight configuration. Fault 11 is never cleared by these
@@ -488,7 +491,20 @@ The micro-ROS pools remain 10 publishers / 5 subscriptions / 1 service / 1 clien
 the application uses 6 / 4 / 1 / 0, with six executor handles. Static messages avoid
 per-frame allocations. Debug/Release cross-compilation and host tests do not prove
 250 Hz timing, RTOS stack high-water marks, XRCE delivery or motor behavior on a
-board; those remain bench checks before enabling POS support. No firmware flash
+board; those remain bench checks before enabling POS support.
+
+Local linked image measurements for this change (including the existing static
+RTOS heap reservation):
+
+| Build | DTCMRAM / 128 KiB | RAM_D2 / 32 KiB | FLASH / 1 MiB |
+| --- | --- | --- | --- |
+| Debug | 122344 B (93.34%) | 26720 B (81.54%) | 176212 B |
+| Release | 122336 B (93.33%) | 26720 B (81.54%) | 137440 B |
+
+DTCMRAM headroom is limited; a successful link does not establish runtime stack
+or heap headroom. Measure task stack high-water marks and allocator free/minimum
+heap during Agent reconnect, active service requests and telemetry load before
+hardware qualification. No firmware flash
 or motor motion is required for the following tests:
 
 ```sh

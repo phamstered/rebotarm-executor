@@ -115,6 +115,18 @@ int main(void)
         assert(!s.switching && !s.lease_id && s.control_epoch==2);
         assert(!motor_v2_mit_allowed(&s));
     }
+    /* Only an unused, disabled grant gets a 500 ms handshake window. */
+    s=fixture(); s.pos_vel_supported_mask=1; s.control_modes[0]=2;
+    r=request(&s,2,1,1); assert(motor_v2_request(&s,&r,true,0,42,0).accepted);
+    motor_v2_watchdog(&s,499); assert(s.lease_id && !s.lease_has_frame);
+    c=command(&s,43); assert(motor_v2_command(&s,&c,0,true,42,499)==0);
+    assert(s.lease_has_frame); motor_v2_watchdog(&s,599); assert(s.lease_id);
+    motor_v2_watchdog(&s,600); assert(!s.lease_id);
+    s=fixture(); s.pos_vel_supported_mask=1; s.control_modes[0]=2;
+    r=request(&s,2,1,1); assert(motor_v2_request(&s,&r,true,0,42,0).accepted);
+    c=command(&s,43); assert(motor_v2_command(&s,&c,0,true,42,501)==MV2_LEASE);
+    motor_v2_watchdog(&s,501); assert(!s.lease_id);
+    assert(!motor_v2_request(&s,&r,true,0,42,501).accepted);
     s=fixture(); s.boot_id=0; r=request(&s,1,1,1);
     assert(motor_v2_request(&s,&r,true,0,42,0).error_code==MV2_IDENTITY);
     puts("motor control V2 tests passed");

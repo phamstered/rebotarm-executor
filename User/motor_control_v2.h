@@ -48,7 +48,7 @@ typedef struct {
     uint32_t config_mask;
     MotorControlRequest last_request;
     MotorControlResponse last_response;
-    bool have_request;
+    bool have_request, lease_has_frame;
 } MotorControlV2;
 typedef bool (*MotorRegisterSend)(uint8_t axis, bool write, uint32_t value, void *context);
 void motor_v2_init(MotorControlV2 *s, uint64_t boot_id);

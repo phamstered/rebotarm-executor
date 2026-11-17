@@ -46,7 +46,7 @@ printf 'y\n' | docker run -i --rm -v "$PWD":/project \
 ```
 
 V2 控制、异步切换和真实停机证明见[接口文档](docs/ros2-interface.md#pos-vel-v2-control-and-runtime-configuration)。
-POS_VEL 支持掩码默认 0，须完成逐型号/固件台架验证后才可开放。
+POS_VEL 支持掩码默认 0，须完成逐型号/固件台架验证后才可开放。当前本地 Debug 链接占用约 93% DTCMRAM；运行时栈/堆余量仍需按接口文档完成台架测量。
 
 ```bash
 # 配置与编译（Debug）

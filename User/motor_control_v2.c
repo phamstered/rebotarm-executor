@@ -103,6 +103,7 @@ MotorControlResponse motor_v2_request(MotorControlV2 *s, const MotorControlReque
                     s->lease_id = s->next_lease;
                     s->last_frame_ms = now;
                     s->lease_granted_at = now;
+                    s->lease_has_frame = false;
                     response.accepted = true;
                 }
             }
@@ -136,7 +137,7 @@ uint16_t motor_v2_command(MotorControlV2 *s, const MotorCommandV2 *c,
     else if (fault) error = MV2_FAULT;
     else if (c->control_mode != 2U || c->mode > 1U) error = MV2_MODE;
     else if (!s->lease_id || c->lease_id != s->lease_id || c->source_id != s->owner_source_id ||
-        (uint32_t)(now - s->last_frame_ms) > 100U) error = MV2_LEASE;
+        (uint32_t)(now - s->last_frame_ms) > (s->lease_has_frame ? 100U : 500U)) error = MV2_LEASE;
     else if (c->active_joint_mask != s->selected_joint_mask) error = MV2_INVALID;
     else if (have_sequence && (int32_t)(c->sequence - last_sequence) <= 0) error = MV2_SEQUENCE;
     else for (uint8_t i = 0; i < MV2_JOINTS; ++i) {
@@ -150,7 +151,7 @@ uint16_t motor_v2_command(MotorControlV2 *s, const MotorCommandV2 *c,
             (c->mode == 1U && (c->position[i] < s->position_min[i] || c->position[i] > s->position_max[i])))) { error = MV2_LIMITS; break; }
     }
     if (error) { s->rejected_sequence = c->sequence; s->reject_code = error; }
-    else { s->last_frame_ms = now; s->reject_code = MV2_OK; }
+    else { s->last_frame_ms = now; s->lease_has_frame = true; s->reject_code = MV2_OK; }
     return error;
 }
 void motor_v2_disable(MotorControlV2 *s)
@@ -162,7 +163,7 @@ void motor_v2_disable(MotorControlV2 *s)
 void motor_v2_fault(MotorControlV2 *s) { motor_v2_disable(s); }
 void motor_v2_watchdog(MotorControlV2 *s, uint32_t now)
 {
-    if (s->lease_id && (uint32_t)(now - s->last_frame_ms) > 100U) {
+    if (s->lease_id && (uint32_t)(now - s->last_frame_ms) > (s->lease_has_frame ? 100U : 500U)) {
         motor_v2_disable(s);
     }
 }
