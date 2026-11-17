@@ -10,6 +10,7 @@ static unsigned tx_count, rx_count, rx_pos;
 static bool tx_empty = true;
 static bool tick_advancing, fail_send;
 bool fdcan1_tx_empty(void) { return tx_empty; }
+uint32_t fdcan1_tx_free(void) { return 8U; }
 uint32_t HAL_GetTick(void) { return tick_advancing ? clock_ms++ : clock_ms; }
 uint8_t fdcanx_send_data(FDCAN_HandleTypeDef *h, uint16_t id, uint8_t *data, uint32_t len)
 {
@@ -87,11 +88,16 @@ int main(void)
     assert(pos==0.4f && vel==0.2f);
     /* Stop acknowledges sequence, but enabled mask waits for physical feedback. */
     stop=disable(44);assert(motor_bridge_accept_command(&stop,133));
-    tx_count=0;motor_bridge_control_step(134);assert(sent[0].id==0x101 && sent[0].data[7]==0xfd);
+    tx_count=0;motor_bridge_control_step(134);
+    bool stopped_pos=false;
+    for(unsigned i=0;i<tx_count;++i) if(sent[i].id==0x101 && sent[i].data[7]==0xfd) stopped_pos=true;
+    assert(stopped_pos);
     assert(state.motor_enabled[0]);assert(!state.control.lease_id);
     assert(!motor_bridge_accept_command_v2(&c,134));
     clock_ms=135; for(unsigned i=0;i<7;++i) feedback(i,false);
-    motor_bridge_control_step(135);assert(disabled_proven(135));
+    motor_bridge_control_step(135);assert(!disabled_proven(135));
+    clock_ms=136;for(unsigned i=0;i<7;++i) feedback(i,false);
+    motor_bridge_control_step(136);assert(disabled_proven(136));
     /* Fault 11 remains latched, yet a new global DISABLE is always admitted. */
     state.communication_loss_latched=true;state.snapshot.fault_code=11;
     stop=disable(45);stop.position[0]=NAN;assert(motor_bridge_accept_command(&stop,136));
@@ -166,6 +172,14 @@ int main(void)
         assert(!motor_bridge_accept_command(&legacy,104));
         state.snapshot.velocity[6]=state.snapshot.effort[6]=0;state.snapshot.position[6]=0.5f;
         motor_bridge_safety_step(105);assert(state.snapshot.mode==3 && state.snapshot.fault_code!=0);
+        motor_bridge_control_step(106);
+        clock_ms=107;for(unsigned j=0;j<7;++j) feedback(j,false);
+        motor_bridge_control_step(108);assert(disabled_proven(108));
+        uint32_t stopped_at=state.disable_ms;
+        for(unsigned now=110;now<=160;now+=10) {
+            motor_bridge_safety_step(now);motor_bridge_control_step(now);
+            assert(disabled_proven(now) && state.disable_ms==stopped_at);
+        }
     }
 #endif
     puts("motor bridge V2 CAN tests passed");

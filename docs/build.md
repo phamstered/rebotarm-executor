@@ -38,6 +38,13 @@ cmake --build build/Debug --target clean
 默认调用仍构建 `build/Debug`，并显式关闭台架选项。
 窗口只属于本次现场验证，命令例子与只读诊断见[接口文档](./ros2-interface#joint7-bench-image)。
 
+首次启用新接口固件时，micro-ROS 实体创建顺序可能与旧固件不同。仅在机械臂
+已经 DISABLE 后，停止对应串口的 Agent 至少 5 秒再启动，让旧会话销毁并重建。
+重新检查 JointState、HardwareStatus 和 MotorControlStatus 的类型与字段，不能
+沿用重启前反馈或仅凭 Topic 名存在判断通信正常。
+旧实体映射可能把 JointState 数据解释成 HardwareStatus，出现非法 mode、关节
+掩码或故障码；先核对类型与会话，不将这些错解字段当成真实电机故障。
+
 ## 遥测与会话检查
 
 ```bash

@@ -53,6 +53,8 @@ jobs:
           /tmp/motor-v2-test
           cc -std=c11 -Wall -Wextra -Werror -Iscripts/host_stubs -IUser scripts/test_motor_bridge_v2.c User/motor_control_v2.c User/damiao_protocol.c -lm -o /tmp/motor-bridge-v2-test
           /tmp/motor-bridge-v2-test
+          cc -std=c11 -Wall -Wextra -Werror -Iscripts/host_stubs -IUser scripts/test_motor_stop_fifo.c User/motor_control_v2.c User/damiao_protocol.c -lm -o /tmp/motor-stop-fifo-test
+          /tmp/motor-stop-fifo-test
 
       - name: Joint7 bench guards (no hardware)
         run: |
