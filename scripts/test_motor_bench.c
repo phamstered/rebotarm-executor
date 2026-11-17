@@ -4,23 +4,32 @@
 
 static unsigned calls;
 static int bad_rid = -1;
-static float damp = 4.0f, vmax = 30.0f;
+/* Recorded joint7 values; Deta must be read separately from physical Damp. */
+static float damp = 0.000212438f, acc = 2.0f, dec = -2.0f;
+static float max_spd = 600.0f, vmax = 30.0f, deta = 4.0f;
 static int read_register(uint8_t rid, uint32_t *value, void *context)
 {
     (void)context;
     ++calls;
     if (rid == bad_rid) return -3;
-    float f = rid == 11 ? damp : rid == 21 ? 12.5f : rid == 22 ? vmax : rid == 23 ? 10.0f : 1.0f;
+    float f = rid == 11 ? damp : rid == 4 ? acc : rid == 5 ? dec :
+        rid == 6 ? max_spd : rid == 31 ? deta :
+        rid == 21 ? 12.5f : rid == 22 ? vmax : rid == 23 ? 10.0f : 1.0f;
     memcpy(value, &f, sizeof(f));
-    if (rid == 13 || rid == 14 || rid == 15 || rid == 36) *value = 123;
+    if (rid == 13 || rid == 15) *value = 0; /* Reserved fields may be zero. */
+    if (rid == 14) *value = 0x38313037;
+    if (rid == 36) *value = 54;
     return 0;
 }
 int main(void)
 {
     MotorBenchDiagnostics d;
     assert(motor_bench_collect(&d, true, 0.50f, read_register, NULL));
-    assert(d.complete && d.read_mask == 0x7ff && d.admitted_mask == 0x40 && calls == 11);
-    assert(d.raw[0] == 123 && motor_bench_float(d.raw[4]) == 4.0f);
+    assert(sizeof(d) == 148 && d.magic == 0x4a374233);
+    assert(d.complete && d.read_mask == 0xfff && d.admitted_mask == 0x40 && calls == 12);
+    assert(d.raw[0] == 0 && d.raw[1] == 0x38313037 && d.raw[2] == 0);
+    assert(motor_bench_float(d.raw[4]) == damp && motor_bench_float(d.raw[6]) == -2.0f);
+    assert(motor_bench_float(d.raw[11]) == 4.0f);
     calls = 0;
     assert(!motor_bench_collect(&d, false, 0.50f, read_register, NULL));
     assert(calls == 0 && d.admitted_mask == 0);
@@ -32,9 +41,36 @@ int main(void)
         assert(!(d.read_mask & (1U << i)) && d.admitted_mask == 0);
     }
     bad_rid = -1;
-    damp = 0; assert(!motor_bench_collect(&d, true, 0.50f, read_register, NULL));
-    damp = NAN; assert(!motor_bench_collect(&d, true, 0.50f, read_register, NULL));
-    damp = 4; vmax = 50; assert(!motor_bench_collect(&d, true, 0.50f, read_register, NULL));
+    const float invalid_dec[] = {0.0f, -0.0f, 2.0f, NAN, INFINITY, -INFINITY};
+    for (unsigned i = 0; i < sizeof(invalid_dec) / sizeof(*invalid_dec); ++i) {
+        dec = invalid_dec[i];
+        assert(!motor_bench_collect(&d, true, 0.50f, read_register, NULL));
+        assert(d.admitted_mask == 0);
+    }
+    dec = -2.0f;
+    const float invalid_deta[] = {0.0f, -4.0f, 0.999f, 30.001f, NAN, INFINITY, -INFINITY};
+    for (unsigned i = 0; i < sizeof(invalid_deta) / sizeof(*invalid_deta); ++i) {
+        deta = invalid_deta[i];
+        assert(!motor_bench_collect(&d, true, 0.50f, read_register, NULL));
+        assert(d.admitted_mask == 0); /* Positive Damp never substitutes for Deta. */
+    }
+    deta = 1.0f; assert(motor_bench_collect(&d, true, 0.50f, read_register, NULL));
+    deta = 30.0f; assert(motor_bench_collect(&d, true, 0.50f, read_register, NULL));
+    deta = 4.0f;
+    float *positive_parameters[] = {&damp, &acc, &max_spd};
+    const float invalid_positive[] = {0.0f, -2.0f, NAN, INFINITY, -INFINITY};
+    for (unsigned i = 0; i < sizeof(positive_parameters) / sizeof(*positive_parameters); ++i) {
+        float original = *positive_parameters[i];
+        for (unsigned j = 0; j < sizeof(invalid_positive) / sizeof(*invalid_positive); ++j) {
+            *positive_parameters[i] = invalid_positive[j];
+            assert(!motor_bench_collect(&d, true, 0.50f, read_register, NULL));
+        }
+        *positive_parameters[i] = original;
+    }
+    max_spd = 0.001f; /* Different shaft reference: never compare against command vmax. */
+    assert(motor_bench_collect(&d, true, 0.50f, read_register, NULL));
+    max_spd = 600.0f;
+    vmax = 50; assert(!motor_bench_collect(&d, true, 0.50f, read_register, NULL));
     assert(!motor_bench_feedback_reason(true, 100, 0.5f, 0.10f, 0.30f));
     assert(!motor_bench_feedback_reason(true, 100, 0.5f, -0.10f, -0.30f));
     assert(motor_bench_feedback_reason(true, 101, 0.5f, 0, 0) == 1);

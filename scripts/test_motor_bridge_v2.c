@@ -132,17 +132,24 @@ int main(void)
     for(unsigned j=0;j<MOTOR_BENCH_REGISTER_COUNT;++j) {
         f=&received[rx_count++];memset(f,0,sizeof(*f));f->id=0x17;
         uint8_t rid=motor_bench_registers[j];damiao_encode_register_read_cmd(7,rid,f->data);
-        float value=rid==21?12.5f:rid==22?30.0f:rid==23?10.0f:1.0f;
+        float value=rid==5?-2.0f:rid==31?4.0f:rid==21?12.5f:rid==22?30.0f:rid==23?10.0f:1.0f;
         memcpy(f->data+4,&value,4);
     }
     initialize_joint7_bench();
     assert(motor_bench_diagnostics.complete && motor_bench_diagnostics.admitted_mask==0x40);
+    assert(motor_bench_diagnostics.read_mask==0xfff && tx_count==12);
+    assert(sent[11].data[3]==31 && motor_bench_float(motor_bench_diagnostics.raw[11])==4.0f);
     assert(state.control.pos_vel_supported_mask==0x40 && state.control.position_min[0]==0);
     assert(state.control.position_min[6]==MOTOR_BENCH_POSITION_MIN);
     for(unsigned j=0;j<tx_count;++j) {
         assert(sent[j].id==damiao_get_register_can_id());
         assert(sent[j].data[0]==7 && sent[j].data[2]==DAMIAO_REG_READ_MARKER);
     }
+    /* Reuse the valid first eleven replies: an unread Deta must still fail closed. */
+    rx_pos=3;--rx_count;tx_count=0;tick_advancing=true;
+    initialize_joint7_bench();assert(!state.control.pos_vel_supported_mask);
+    assert(motor_bench_diagnostics.read_mask==0x7ff);
+    assert(motor_bench_diagnostics.errors[11]==DAMIAO_ERR_TIMEOUT);
     state.drive_status[0]=DAMIAO_STATUS_ENABLED;tx_count=0;
     initialize_joint7_bench();assert(!state.control.pos_vel_supported_mask && tx_count==0);
     fixture();state.snapshot.position[6]=0.5f;fail_send=true;
@@ -151,7 +158,7 @@ int main(void)
     fixture();state.snapshot.position[6]=0.5f;tick_advancing=true;
     initialize_joint7_bench();assert(!state.control.pos_vel_supported_mask);
     assert(motor_bench_diagnostics.read_mask==0 && motor_bench_diagnostics.errors[0]==DAMIAO_ERR_TIMEOUT);
-    assert(clock_ms>=1100 && clock_ms<1600); /* Bounded even with no replies. */
+    assert(clock_ms>=1300 && clock_ms<1600); /* Twelve bounded reads, starting at 100 ms. */
     for(unsigned reason=1;reason<=5;++reason) {
         fixture();state.using_v2=true;state.have_command=true;state.snapshot.mode=1;
         state.command_v2.active_joint_mask=0x40;state.control.lease_id=4;

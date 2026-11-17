@@ -3,11 +3,47 @@
 import os
 from pathlib import Path
 import shutil
+import struct
 import subprocess
 import tempfile
 import unittest
 
+from decode_joint7_bench import decode_dump
+
 ROOT = Path(__file__).resolve().parents[1]
+
+
+class BenchDumpTest(unittest.TestCase):
+    def dump(self, *, magic=0x4a374233, read_mask=0xfff, error=0, trip=0):
+        raw = [0, 0x38313037, 0, 54]
+        raw += [struct.unpack('<I', struct.pack('<f', x))[0]
+                for x in [0.000212438, 2, -2, 600, 12.5, 30, 10, 4]]
+        return struct.pack('<4I4f12I12i2I3f', magic, 1, read_mask, 0x40,
+                           0.488, 0.509, 0.05, 0.508316, *raw,
+                           *([0] * 11 + [error]), trip, 123, 0.49, -0.02, 0.1)
+
+    def test_dump_layout_and_signed_values(self):
+        result = decode_dump(self.dump())
+        self.assertTrue(result['startup_diagnostic_ready'])
+        self.assertEqual(result['registers']['DEC']['value'], -2)
+        self.assertEqual(result['registers']['Deta']['rid'], 31)
+        self.assertEqual(result['registers']['Deta']['value'], 4)
+        self.assertEqual(result['trip_ms'], 123)
+        self.assertAlmostEqual(result['trip_position'], 0.49)
+        self.assertAlmostEqual(result['trip_velocity'], -0.02)
+        self.assertAlmostEqual(result['trip_effort'], 0.1)
+
+    def test_incomplete_deta_read_or_trip_is_not_ready(self):
+        for changes in ({'read_mask': 0x7ff}, {'error': -3}, {'trip': 5}):
+            self.assertFalse(decode_dump(self.dump(**changes))['startup_diagnostic_ready'])
+        result = decode_dump(self.dump(read_mask=0x7ff, error=-3))
+        self.assertFalse(result['registers']['Deta']['read_ok'])
+        self.assertEqual(result['registers']['Deta']['error'], -3)
+
+    def test_old_or_invalid_layout_is_rejected(self):
+        for data in (bytes(140), self.dump(magic=0x4a374232), self.dump()[:-1], self.dump()+b'\0'):
+            with self.assertRaises(ValueError):
+                decode_dump(data)
 
 
 class BenchBuildTest(unittest.TestCase):

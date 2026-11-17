@@ -17,10 +17,11 @@
 
 /* SWD-readable, startup-only diagnostics. This is not a qualification record.
  * raw[] order: hw_ver, sw_ver, SN, sub_ver, Damp, ACC, DEC, MAX_SPD,
- * PMAX, VMAX, TMAX. Versions/serial are u32; remaining values are float bits. */
-#define MOTOR_BENCH_REGISTER_COUNT 11U
+ * PMAX, VMAX, TMAX, Deta. Versions/serial are u32; remaining values are float bits.
+ * Damp is physical viscosity; Deta is the speed-loop damping factor. */
+#define MOTOR_BENCH_REGISTER_COUNT 12U
 static const uint8_t motor_bench_registers[MOTOR_BENCH_REGISTER_COUNT] =
-    {13, 14, 15, 36, 11, 4, 5, 6, 21, 22, 23};
+    {13, 14, 15, 36, 11, 4, 5, 6, 21, 22, 23, 31};
 typedef struct {
     uint32_t magic, complete, read_mask, admitted_mask;
     float position_min, position_max, velocity_max, startup_position;
@@ -55,7 +56,7 @@ static inline bool motor_bench_collect(MotorBenchDiagnostics *d, bool disabled,
     float position, MotorBenchRead read_register, void *context)
 {
     memset(d, 0, sizeof(*d));
-    d->magic = 0x4a374232U; /* J7B2 */
+    d->magic = 0x4a374233U; /* J7B3: appended Deta; dump layout changed. */
     d->position_min = MOTOR_BENCH_POSITION_MIN;
     d->position_max = MOTOR_BENCH_POSITION_MAX;
     d->velocity_max = MOTOR_BENCH_VELOCITY_MAX;
@@ -74,9 +75,13 @@ static inline bool motor_bench_collect(MotorBenchDiagnostics *d, bool disabled,
     }
     for (uint32_t i = 4; i <= 7; ++i) {
         float value = motor_bench_float(d->raw[i]);
-        valid = valid && isfinite(value) && value > 0.0f;
+        /* DEC is signed deceleration, unlike positive ACC/Damp/MAX_SPD. */
+        valid = valid && isfinite(value) && (i == 6 ? value < 0.0f : value > 0.0f);
     }
-    valid = valid && motor_bench_float(d->raw[7]) >= d->velocity_max &&
+    /* MAX_SPD is a pre-gearbox motor parameter, not the output-shaft command cap. */
+    float damping_factor = motor_bench_float(d->raw[11]);
+    valid = valid && isfinite(damping_factor) &&
+        damping_factor >= 1.0f && damping_factor <= 30.0f &&
         motor_bench_float(d->raw[8]) == 12.5f &&
         motor_bench_float(d->raw[9]) == 30.0f &&
         motor_bench_float(d->raw[10]) == 10.0f;
