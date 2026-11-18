@@ -15,6 +15,7 @@ typedef struct {
     MotorBenchDiagnostics admission;
     MotorBenchLoopDiagnostics loop;
     MotorBenchTraceMeta trace;
+    MotorBenchCalibrationDiagnostics calibration;
 } MotorBenchSnapshot;
 
 /* Read-only, bounded copies. No CAN requests, state reset or publication. */

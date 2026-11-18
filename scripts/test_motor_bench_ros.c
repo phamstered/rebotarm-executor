@@ -85,6 +85,38 @@ int main(int argc, char **argv)
     assert(motor_bench_ros_encode_trace(words, 87U, 1U, 2U, &page, records) == 0U);
     page.count = 0U;
     assert(motor_bench_ros_encode_trace(words, 24U, 1U, 2U, &page, NULL) == 24U);
+
+    MotorBenchCalibrationDiagnostics calibration = {0};
+    calibration.version = calibration.complete = 1U;
+    calibration.read_mask = 0xffU;
+    calibration.started_ms = 21U;
+    calibration.completed_ms = 29U;
+    for (uint32_t i = 0U; i < 8U; ++i) calibration.raw[i] = 0x3f800000U + i;
+    calibration.raw[0] = 10000U; /* TIMEOUT is a u32 count of 50 us units. */
+    calibration.raw[2] = 21U; /* NPP is u32, not float32. */
+    memset(words, 0xa5, sizeof(words));
+    assert(motor_bench_ros_encode_calibration(words, 28U, 1U, 2U, &calibration) == 0U);
+    assert(words[0] == 0xa5a5a5a5U);
+    assert(motor_bench_ros_encode_calibration(NULL, 29U, 1U, 2U, &calibration) == 0U);
+    assert(motor_bench_ros_encode_calibration(words, 29U, 1U, 2U, NULL) == 0U);
+    assert(words[0] == 0xa5a5a5a5U);
+    count = motor_bench_ros_encode_calibration(words, 29U, 0x1234567887654321ULL,
+                                              125U, &calibration);
+    assert(count == 29U && words[29] == 0xa5a5a5a5U);
+    assert(words[0] == 0x4a374331U && words[1] == 1U && words[2] == 29U);
+    assert(words[3] == 0x87654321U && words[4] == 0x12345678U && words[5] == 125U);
+    assert(words[6] == 0U && words[7] == 0U);
+    assert(memcmp(words + 8U, &calibration, 84U) == 0);
+    if (argc > 1) emit(words, count);
+    /* Raw nonfinite values and signed failures are observations, preserved verbatim. */
+    calibration.complete = 0U;
+    calibration.read_mask = 0U;
+    calibration.raw[1] = 0x7fc00000U;
+    calibration.errors[1] = -6;
+    assert(motor_bench_ros_encode_calibration(words, 29U, 1U, 2U, &calibration) == 29U);
+    assert(words[9] == 0U && words[10] == 0U && words[14] == 0x7fc00000U);
+    assert(words[22] == 0xfffffffaU && words[29] == 0xa5a5a5a5U);
+    assert(memcmp(words + 8U, &calibration, 84U) == 0);
     if (argc == 1) puts("bench ROS wire encoding tests passed");
     return 0;
 }
@@ -94,6 +126,9 @@ int main(int argc, char **argv)
 #endif
 #ifdef MOTOR_BENCH_TRACE_CAPACITY
 #error "Production wire header must not include trace storage/helpers"
+#endif
+#ifdef MOTOR_BENCH_ROS_CALIBRATION_WORDS
+#error "Production build must not expose bench calibration encoding"
 #endif
 int main(void)
 {

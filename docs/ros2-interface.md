@@ -606,8 +606,8 @@ an explicit restart/reflash. This is a feedback-triggered stop; it cannot impose
 a drive-internal current/torque ceiling or guarantee zero transient overshoot.
 
 With the bench diagnostics, profile transaction, guard and queued STOP
-bookkeeping, local linked DTCMRAM use is 123704 bytes (Debug) / 123696 bytes
-(Release), about 94.38% of 128 KiB. This remains a static
+bookkeeping, local linked DTCMRAM use is 123936 bytes (Debug) / 123928 bytes
+(Release), about 94.56% of 128 KiB. This remains a static
 link measurement; task stack high-water marks and allocator headroom still need
 hardware measurement under the intended traffic.
 
@@ -750,7 +750,7 @@ nor a sampled speed guard guarantees continuous physical speed or arrival.
 
 ### Bench diagnostics over ROS
 
-The explicitly enabled joint7 bench image also publishes two `std_msgs/msg/UInt32MultiArray`
+The explicitly enabled joint7 bench image also publishes three `std_msgs/msg/UInt32MultiArray`
 Topics with BEST_EFFORT / VOLATILE QoS. They are absent from production builds:
 
 - `/stm32/joint7_bench_snapshot`: at most 1 Hz; original J7B3 admission/trip
@@ -761,9 +761,12 @@ Topics with BEST_EFFORT / VOLATILE QoS. They are absent from production builds:
   repeatedly exports the frozen retained window so a late subscriber can collect
   all pages. Transport delivery is not guaranteed; the offline decoder detects
   missing/conflicting pages rather than assuming completeness.
+- `/stm32/joint7_bench_calibration`: at most 1 Hz; a separate startup-only
+  observation of drive timeout, inertia and electrical identification values.
+  It does not change the original snapshot/trace or profile message layouts.
 
 Publishing occurs only in the micro-ROS task, after fresh verified all-axis
-DISABLE, with no enabled axis, no switching and no lease. Both Topics are
+DISABLE, with no enabled axis, no switching and no lease. All three Topics are
 suppressed during motion and the stop-proof interval. The real-time paths only
 copy bounded records; they never allocate, serialize, wait for ROS, or publish.
 Message backing arrays are static. A page copy holds the existing critical
@@ -792,11 +795,44 @@ successful Deta read therefore does not prove that the running firmware uses it
 to limit overshoot. Record raw software/sub-version and loop values; never
 change Gr or assume that register validity qualifies low-speed POS_VEL.
 
+The calibration observation reads the following fixed joint7 RIDs after the
+existing loop reads. Each has an independent 100 ms deadline; the additional
+startup delay is bounded by 0.8 seconds. Reads are skipped if initial feedback
+did not establish that all axes were disabled. No value or read success affects
+admission, the POS_VEL support mask, profile values, faults or automatic enables.
+No write, save or recalibration is performed.
+
+| Index | RID | Value | Representation |
+| --- | --- | --- | --- |
+| 0 | 9 | TIMEOUT, in 50 µs units | uint32 |
+| 1 | 12 | Inertia | float32 bits |
+| 2 | 16 | NPP, pole pairs | uint32 |
+| 3–5 | 17, 18, 19 | Rs, Ls, Flux | float32 bits |
+| 6–7 | 1, 30 | KT_Value, GREF | float32 bits |
+
+The separate J7C1 wire message is 29 uint32 words, empty layout and zero offset:
+words 0–6 use the common magic/version/length/boot low/boot high/MCU tick/reserved
+header, with magic `0x4a374331` and version 1. Word 7 is reserved zero.
+Words 8–12 contain observation version 1, completion, read mask, start tick and
+completion tick; 13–20 are the eight raw register words; 21–28 are signed int32
+read errors represented as uint32. `complete=1` means collection ended, even
+when reads failed. Never interpret zero-filled unread data as a successful zero.
+Nonfinite float bits remain explicitly invalid observations. Existing J7S1,
+J7T1, J7B3 and J7P1 layouts and historical captures remain supported.
+
+These values support a read-only comparison with the motor's own factory record.
+The [B601-DM default export](https://files.seeedstudio.com/wiki/robotics/projects/rebot_arm/DM4310_Default_Parameters.txt)
+is an example for motor ID 4, not a joint7 image to import. Matching software
+and sub-version is useful context, but reserved hardware/SN fields and a
+different identified inertia or damping value cannot establish a damaged motor
+or justify overwriting its individual calibration. The diagnostic supplies no
+automatic restore, tuning or qualification decision.
+
 The 512-record ring occupies 8192 explicitly initialized NOLOAD bytes in RAM_D1,
 not DTCMRAM or the RTOS heap. Local production Debug/Release still link at
 122352/122344 DTCMRAM bytes with no trace allocation. The diagnostic bench
-Debug/Release images, including the profile transaction, use 123704/123696
-DTCMRAM bytes (94.38%/94.37%), 8192 RAM_D1
+Debug/Release images, including the profile transaction and calibration readout,
+use 123936/123928 DTCMRAM bytes (94.56%/94.55%), 8192 RAM_D1
 bytes, and 26720 RAM_D2 bytes. These link sizes include static reservations;
 read the runtime counters as well before drawing conclusions about headroom.
 Records contain MCU milliseconds, a tag and the

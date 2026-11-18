@@ -33,7 +33,7 @@ class BenchRosTest(unittest.TestCase):
         subprocess.run([str(production)], check=True, capture_output=True)
 
     def setUp(self):
-        self.snapshot, self.trace = copy.deepcopy(self.fixture)
+        self.snapshot, self.trace, self.calibration = copy.deepcopy(self.fixture)
 
     def split_pages(self):
         first, second = copy.deepcopy(self.trace), copy.deepcopy(self.trace)
@@ -72,6 +72,89 @@ class BenchRosTest(unittest.TestCase):
         self.assertEqual(trace['records'][0]['data_hex'], '0000003fcdcc4c3d')
         self.assertFalse(result['transmission_completion_proven'])
         self.assertFalse(result['motion_success_proven'])
+
+    def test_calibration_roundtrip_typed_rids_and_unchanged_historical_formats(self):
+        result = decode_message(self.calibration)
+        self.assertEqual(result['kind'], 'calibration')
+        self.assertEqual(result['topic'], '/stm32/joint7_bench_calibration')
+        self.assertEqual(result['boot_id'], '0x1234567887654321')
+        self.assertEqual(result['mcu_tick_ms'], 125)
+        self.assertEqual(result['calibration_raw_words'], self.calibration['data'][8:])
+        diagnostics = result['calibration']
+        self.assertEqual([diagnostics[key] for key in
+                          ('version', 'complete', 'read_mask', 'started_ms', 'completed_ms')],
+                         [1, 1, 255, 21, 29])
+        registers = diagnostics['registers']
+        self.assertEqual([value['rid'] for value in registers.values()],
+                         [9, 12, 16, 17, 18, 19, 1, 30])
+        self.assertEqual(registers['TIMEOUT'], dict(rid=9, data_type='uint32',
+                         raw_hex='0x00002710', error=0, read_ok=True,
+                         value=10000, value_valid=True))
+        self.assertEqual(registers['NPP']['value'], 21)
+        self.assertEqual(registers['Inertia']['data_type'], 'float32')
+        self.assertEqual(registers['Inertia']['value'], 1.0 + 2**-23)
+        self.assertEqual(registers['KT_Value']['rid'], 1)
+        self.assertEqual(registers['GREF']['raw_hex'], '0x3f800007')
+        self.assertEqual(self.snapshot['data'][:3], [0x4a375331, 1, 87])
+        self.assertEqual(self.trace['data'][:3], [0x4a375431, 1, 56])
+        old_capture = decode_capture([self.snapshot, self.trace])
+        new_capture = decode_capture([self.snapshot, self.calibration, self.trace])
+        self.assertEqual(new_capture['snapshots'], old_capture['snapshots'])
+        self.assertEqual(new_capture['trace'], old_capture['trace'])
+        self.assertEqual(old_capture['calibrations'], [])
+        self.assertEqual(new_capture['calibrations'], [result])
+
+    def test_calibration_only_and_failed_reads_do_not_imply_success(self):
+        self.calibration['data'][10] = 0
+        self.calibration['data'][21:29] = [0xfffffffa] * 8
+        result = decode_capture([self.calibration])
+        self.assertEqual(result['snapshots'], [])
+        self.assertEqual(result['trace'], dict(status='not_captured', retained_window_complete=False))
+        self.assertFalse(result['motion_success_proven'])
+        self.assertFalse(result['transmission_completion_proven'])
+        self.assertEqual(result['calibrations'][0]['calibration']['complete'], 1)
+        for register in result['calibrations'][0]['calibration']['registers'].values():
+            self.assertFalse(register['read_ok'])
+            self.assertFalse(register['value_valid'])
+            self.assertEqual(register['error'], -6)
+        self.calibration['data'][9] = 0  # Initialized, collection has not ended.
+        self.assertEqual(decode_message(self.calibration)['calibration']['complete'], 0)
+
+    def test_calibration_nonfinite_float_and_uint32_max_preserve_raw(self):
+        for bits, label in ((0x7fc00000, 'nan'), (0x7f800000, 'inf'), (0xff800000, '-inf')):
+            with self.subTest(bits=bits):
+                item = copy.deepcopy(self.calibration)
+                item['data'][13:21] = [bits] * 8
+                item['data'][13] = item['data'][15] = 0xffffffff
+                result = decode_message(item)
+                self.assertEqual(result['calibration_raw_words'], item['data'][8:])
+                for name, register in result['calibration']['registers'].items():
+                    if name in ('TIMEOUT', 'NPP'):
+                        self.assertEqual(register['value'], 0xffffffff)
+                        self.assertTrue(register['value_valid'])
+                    else:
+                        self.assertEqual(register['raw_hex'], f'0x{bits:08x}')
+                        self.assertEqual(register['value'], label)
+                        self.assertFalse(register['value_valid'])
+                    self.assertTrue(register['read_ok'])
+                json.dumps(result, allow_nan=False)
+
+    def test_calibration_partial_reads_boot_consistency_and_malformed_fields(self):
+        self.calibration['data'][10] &= ~(1 << 7)
+        self.calibration['data'][28] = 0xfffffffd
+        register = decode_message(self.calibration)['calibration']['registers']['GREF']
+        self.assertEqual(register['error'], -3)
+        self.assertFalse(register['read_ok'])
+        self.assertFalse(register['value_valid'])
+        for index, value in ((7, 1), (8, 2), (9, 2), (10, 0x100), (21, 1)):
+            item = copy.deepcopy(self.calibration)
+            item['data'][index] = value
+            with self.subTest(index=index), self.assertRaises(ValueError):
+                decode_message(item)
+        self.calibration['data'][3] ^= 1
+        for companion in (self.snapshot, self.trace, self.fixture[2]):
+            with self.subTest(companion=companion), self.assertRaisesRegex(ValueError, 'mixed boot'):
+                decode_capture([companion, self.calibration])
 
     def test_snapshot_only_and_failed_reads_never_mean_trace_success(self):
         self.snapshot['data'][55] &= ~(1 << 8)
@@ -118,7 +201,7 @@ class BenchRosTest(unittest.TestCase):
 
     def test_truncated_extra_words_bad_version_lengths_and_reserved_rejected(self):
         cases = []
-        for original in (self.snapshot, self.trace):
+        for original in (self.snapshot, self.trace, self.calibration):
             for index, value in ((1, 2), (2, 999), (6, 1)):
                 item = copy.deepcopy(original)
                 item['data'][index] = value
@@ -223,6 +306,15 @@ class BenchRosTest(unittest.TestCase):
         self.assertEqual(len(result['snapshots']), 1)
         with self.assertRaises(ValueError):
             decode_capture([dict(topic='/stm32/joint7_bench_snapshot', message={})])
+        calibration = dict(topic='/stm32/joint7_bench_calibration', elapsed_ms=101,
+                           message=dict(self.calibration, layout={'dim': [], 'data_offset': 0}))
+        result = decode_capture([{'metadata': {'host': 'test'}}, native, calibration, self.trace])
+        self.assertEqual(len(result['calibrations']), 1)
+        self.assertTrue(result['trace']['retained_window_complete'])
+        with self.assertRaises(ValueError):
+            decode_capture([dict(calibration, message={})])
+        with self.assertRaisesRegex(ValueError, 'topic and message'):
+            decode_capture([dict(calibration, message=self.snapshot)])
 
     def test_json_jsonl_duplicate_keys_and_cli_are_strict(self):
         path = self.directory / 'capture.jsonl'
@@ -232,6 +324,12 @@ class BenchRosTest(unittest.TestCase):
                                 text=True, capture_output=True)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertFalse(json.loads(result.stdout)['motion_success_proven'])
+        path.write_text(json.dumps(dict(topic='/stm32/joint7_bench_calibration',
+                                       elapsed_ms=123, message=self.calibration)))
+        result = subprocess.run(['python3', str(ROOT / 'scripts/decode_joint7_bench_ros.py'), str(path)],
+                                text=True, capture_output=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(len(json.loads(result.stdout)['calibrations']), 1)
         path.write_text(json.dumps([self.snapshot, self.trace]))
         self.assertEqual(len(read_messages(path)), 2)
         path.write_text('{"data":[],"data":[]}')

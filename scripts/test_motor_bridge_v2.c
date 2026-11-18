@@ -42,6 +42,7 @@ static void fixture(void)
 #if MOTOR_BENCH_JOINT7_POSVEL
     memset((void *)&motor_bench_diagnostics,0,sizeof(motor_bench_diagnostics));
     memset((void *)&motor_bench_loop_diagnostics,0,sizeof(motor_bench_loop_diagnostics));
+    motor_bench_init_calibration((MotorBenchCalibrationDiagnostics *)&motor_bench_calibration_diagnostics);
     motor_bench_trace_init(&motor_bench_trace_meta,motor_bench_trace_records);
     motor_bench_profile_init(&motor_bench_profile,42);
     /* These existing adapter scenarios start with already-proven test profile. */
@@ -147,15 +148,29 @@ int main(void)
         float value=j==0?10.0f:j==1?1000.0f:j==6?100.0f:0.0f;
         memcpy(f->data+4,&value,4);
     }
+    const uint32_t calibration_bits[] = {UINT32_MAX,0x37e501f9U,14,0x7fc00001U,
+        0x39551d0eU,0x3b900943U,0,0x3f800000U};
+    for(unsigned j=0;j<MOTOR_BENCH_CALIBRATION_REGISTER_COUNT;++j) {
+        f=&received[rx_count++];memset(f,0,sizeof(*f));f->id=0x17;
+        damiao_encode_register_read_cmd(7,motor_bench_calibration_registers[j],f->data);
+        memcpy(f->data+4,&calibration_bits[j],4);
+    }
     initialize_joint7_bench();
     assert(motor_bench_diagnostics.complete && motor_bench_diagnostics.admitted_mask==0x40);
-    assert(motor_bench_diagnostics.read_mask==0xfff && tx_count==21);
+    assert(motor_bench_diagnostics.read_mask==0xfff && tx_count==29);
     assert(sent[11].data[3]==31 && motor_bench_float(motor_bench_diagnostics.raw[11])==4.0f);
     assert(motor_bench_loop_diagnostics.complete && motor_bench_loop_diagnostics.read_mask==0x1ff);
     assert(motor_bench_float(motor_bench_loop_diagnostics.raw[0])==10.0f);
     MotorBenchSnapshot bench_snapshot; motor_bridge_get_bench_snapshot(&bench_snapshot);
     assert(bench_snapshot.admission.magic==0x4a374233 && sizeof(bench_snapshot.admission)==148);
     assert(bench_snapshot.loop.raw[1]==motor_bench_loop_diagnostics.raw[1]);
+    assert(bench_snapshot.calibration.version==1 && bench_snapshot.calibration.complete);
+    assert(sizeof(bench_snapshot.calibration)==84 && bench_snapshot.calibration.read_mask==0xff);
+    assert(!memcmp(bench_snapshot.calibration.raw,calibration_bits,sizeof(calibration_bits)));
+    assert(bench_snapshot.calibration.started_ms>=bench_snapshot.loop.completed_ms);
+    assert(bench_snapshot.calibration.completed_ms>=bench_snapshot.calibration.started_ms);
+    for(unsigned j=0;j<MOTOR_BENCH_CALIBRATION_REGISTER_COUNT;++j)
+        assert(sent[21+j].data[3]==motor_bench_calibration_registers[j]);
     MotorBenchTracePage trace_page;MotorBenchTraceRecord trace_records[8];
     uint32_t trace_cursor=0;bool exact_read_rx=false;
     while(motor_bridge_copy_bench_trace(trace_cursor,trace_records,8,&trace_page)) {
@@ -180,15 +195,23 @@ int main(void)
     rx_pos=3;rx_count=3+12;tx_count=0;
     initialize_joint7_bench();assert(state.control.pos_vel_supported_mask==0x40);
     assert(!motor_bench_loop_diagnostics.read_mask && motor_bench_loop_diagnostics.errors[0]==DAMIAO_ERR_TIMEOUT);
+    assert(motor_bench_calibration_diagnostics.complete && !motor_bench_calibration_diagnostics.read_mask);
+    for(unsigned j=0;j<MOTOR_BENCH_CALIBRATION_REGISTER_COUNT;++j)
+        assert(motor_bench_calibration_diagnostics.errors[j]==DAMIAO_ERR_TIMEOUT);
     state.drive_status[0]=DAMIAO_STATUS_ENABLED;tx_count=0;
     initialize_joint7_bench();assert(!state.control.pos_vel_supported_mask && tx_count==0);
+    assert(motor_bench_calibration_diagnostics.complete && !motor_bench_calibration_diagnostics.read_mask);
+    for(unsigned j=0;j<MOTOR_BENCH_CALIBRATION_REGISTER_COUNT;++j)
+        assert(motor_bench_calibration_diagnostics.errors[j]==DAMIAO_ERR_NOT_DISABLED);
     fixture();state.snapshot.position[6]=0.5f;fail_send=true;
     initialize_joint7_bench();assert(!state.control.pos_vel_supported_mask);
     assert(motor_bench_diagnostics.read_mask==0 && motor_bench_diagnostics.errors[0]==DAMIAO_ERR_CAN_WRITE);
+    assert(motor_bench_calibration_diagnostics.errors[0]==DAMIAO_ERR_CAN_WRITE);
     fixture();state.snapshot.position[6]=0.5f;tick_advancing=true;
     initialize_joint7_bench();assert(!state.control.pos_vel_supported_mask);
     assert(motor_bench_diagnostics.read_mask==0 && motor_bench_diagnostics.errors[0]==DAMIAO_ERR_TIMEOUT);
-    assert(clock_ms>=2200 && clock_ms<2600); /* Twenty-one bounded reads from 100 ms. */
+    assert(clock_ms>=3000 && clock_ms<3400); /* Twenty-nine bounded reads from 100 ms. */
+    assert(motor_bench_calibration_diagnostics.errors[0]==DAMIAO_ERR_TIMEOUT);
     for(unsigned reason=1;reason<=5;++reason) {
         fixture();state.using_v2=true;state.have_command=true;state.snapshot.mode=1;
         state.command_v2.active_joint_mask=0x40;state.control.lease_id=4;

@@ -42,6 +42,37 @@ typedef struct {
     int32_t errors[MOTOR_BENCH_LOOP_REGISTER_COUNT];
 } MotorBenchLoopDiagnostics;
 
+/* Separate startup-only observations. TIMEOUT/NPP are u32; the other raw
+ * values are float bits. No value or read error changes bench admission. */
+#define MOTOR_BENCH_CALIBRATION_REGISTER_COUNT 8U
+static const uint8_t motor_bench_calibration_registers[MOTOR_BENCH_CALIBRATION_REGISTER_COUNT] =
+    {9, 12, 16, 17, 18, 19, 1, 30};
+typedef struct {
+    uint32_t version, complete, read_mask, started_ms, completed_ms;
+    uint32_t raw[MOTOR_BENCH_CALIBRATION_REGISTER_COUNT];
+    int32_t errors[MOTOR_BENCH_CALIBRATION_REGISTER_COUNT];
+} MotorBenchCalibrationDiagnostics;
+
+static inline void motor_bench_init_calibration(MotorBenchCalibrationDiagnostics *d)
+{
+    memset(d, 0, sizeof(*d));
+    d->version = 1U;
+    for (uint32_t i = 0U; i < MOTOR_BENCH_CALIBRATION_REGISTER_COUNT; ++i)
+        d->errors[i] = -6; /* DAMIAO_ERR_NOT_DISABLED; no request was sent. */
+}
+
+static inline void motor_bench_collect_calibration(MotorBenchCalibrationDiagnostics *d,
+    bool disabled, MotorBenchRead read_register, void *context)
+{
+    motor_bench_init_calibration(d);
+    for (uint32_t i = 0U; i < MOTOR_BENCH_CALIBRATION_REGISTER_COUNT; ++i) {
+        if (!disabled) continue;
+        d->errors[i] = read_register(motor_bench_calibration_registers[i], &d->raw[i], context);
+        if (d->errors[i] == 0) d->read_mask |= 1U << i;
+    }
+    d->complete = 1U;
+}
+
 static inline void motor_bench_collect_loop(MotorBenchLoopDiagnostics *d,
     bool disabled, MotorBenchRead read_register, void *context)
 {
