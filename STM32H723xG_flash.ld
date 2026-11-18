@@ -241,6 +241,16 @@ SECTIONS
     . = ALIGN(8);
   } >DTCMRAM
 
+  /* Opt-in bench trace: no DMA users. Explicitly initialized by motor_bridge
+     before capture; keep the bounded buffer out of the nearly-full DTCM. */
+  .motor_bench_trace (NOLOAD) :
+  {
+    . = ALIGN(32);
+    *(.motor_bench_trace)
+    *(.motor_bench_trace*)
+    . = ALIGN(32);
+  } >RAM_D1
+
   /* Large non-DMA USB transport queues. They are initialized by the transport
      after reset and kept out of the nearly-full DTCM region. */
   .usb_transport (NOLOAD) :

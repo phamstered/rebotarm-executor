@@ -104,6 +104,33 @@ static DamiaoMotorState motor_state[MOTOR_BRIDGE_JOINT_COUNT];
 #if MOTOR_BENCH_JOINT7_POSVEL
 /* Retained as a global ELF symbol for read-only SWD inspection after startup. */
 volatile MotorBenchDiagnostics motor_bench_diagnostics;
+volatile MotorBenchLoopDiagnostics motor_bench_loop_diagnostics;
+/* The linker places only this explicitly initialized array in RAM_D1. */
+static MotorBenchTraceRecord motor_bench_trace_records[MOTOR_BENCH_TRACE_CAPACITY]
+#if defined(__arm__) || defined(__thumb__)
+    __attribute__((section(".motor_bench_trace"), aligned(32)))
+#endif
+    ;
+static MotorBenchTraceMeta motor_bench_trace_meta;
+
+static void bench_trace_can(uint32_t kind, uint16_t can_id,
+                            const uint8_t *data, uint32_t received_ms)
+{
+    bool joint7 = kind == MOTOR_BENCH_TRACE_RX ? can_id == 0x17U :
+        can_id == 7U || can_id == 0x107U ||
+        (can_id == 0x7ffU && data[0] == 7U && data[1] == 0U);
+    if (!joint7) return;
+    MotorBenchTraceRecord record = {
+        received_ms, motor_bench_trace_tag(kind, 7U, can_id, DAMIAO_DLC), 0U, 0U
+    };
+    memcpy(&record.data0, data, 4U);
+    memcpy(&record.data1, data + 4U, 4U);
+    taskENTER_CRITICAL();
+    motor_bench_trace_append(&motor_bench_trace_meta, motor_bench_trace_records,
+                             &record, HAL_GetTick());
+    taskEXIT_CRITICAL();
+}
+
 static uint16_t bench_latched_fault(void)
 {
     return motor_bench_diagnostics.trip_reason == 1U ? MOTOR_FAULT_FEEDBACK_TIMEOUT :
@@ -149,7 +176,12 @@ static uint16_t validate_command(const MotorBridgeCommand *command)
 
 static bool send_frame(uint16_t can_id, uint8_t *data)
 {
-    return fdcanx_send_data(&hfdcan1, can_id, data, DAMIAO_DLC) == 0U;
+    bool success = fdcanx_send_data(&hfdcan1, can_id, data, DAMIAO_DLC) == 0U;
+#if MOTOR_BENCH_JOINT7_POSVEL
+    bench_trace_can(success ? MOTOR_BENCH_TRACE_TX_OK : MOTOR_BENCH_TRACE_TX_ERROR,
+                    can_id, data, HAL_GetTick());
+#endif
+    return success;
 }
 
 static int protocol_send(uint16_t can_id, const uint8_t *data, void *ctx)
@@ -164,7 +196,13 @@ static int protocol_recv(uint16_t *can_id, uint8_t *data,
     (void)ctx;
     uint32_t start = HAL_GetTick();
     for (;;) {
+#if MOTOR_BENCH_JOINT7_POSVEL
+        uint32_t received_ms;
+        if (fdcan1_get_rx_data_at(can_id, data, &received_ms) == DAMIAO_DLC) {
+            bench_trace_can(MOTOR_BENCH_TRACE_RX, *can_id, data, received_ms);
+#else
         if (fdcan1_get_rx_data(can_id, data) == DAMIAO_DLC) {
+#endif
             return 0;
         }
         uint32_t elapsed = HAL_GetTick() - start;
@@ -314,6 +352,12 @@ static void set_mode(uint8_t mode)
 {
     if (mode == MOTOR_MODE_DISABLE) motor_v2_disable(&state.control);
     if (state.snapshot.mode != mode) {
+#if MOTOR_BENCH_JOINT7_POSVEL
+        if (mode == MOTOR_MODE_DISABLE)
+            motor_bench_trace_trigger(&motor_bench_trace_meta, motor_bench_trace_records,
+                MOTOR_BENCH_TRACE_STOP, state.snapshot.last_command_sequence,
+                state.snapshot.fault_code, HAL_GetTick());
+#endif
         if (mode == MOTOR_MODE_DISABLE) request_disable();
         state.snapshot.mode = mode;
         state.hold_latched = false;
@@ -356,6 +400,7 @@ static int bench_read_register(uint8_t rid, uint32_t *value, void *context)
 static void initialize_joint7_bench(void)
 {
     MotorBenchDiagnostics diagnostics;
+    MotorBenchLoopDiagnostics loop;
     state.control.pos_vel_supported_mask = 0U;
     memset(state.control.position_min, 0, sizeof(state.control.position_min));
     memset(state.control.position_max, 0, sizeof(state.control.position_max));
@@ -370,7 +415,14 @@ static void initialize_joint7_bench(void)
         state.control.position_max[6] = MOTOR_BENCH_POSITION_MAX;
         state.control.velocity_limit_max[6] = MOTOR_BENCH_VELOCITY_MAX;
     }
+    uint32_t started_ms = HAL_GetTick();
+    motor_bench_collect_loop(&loop, disabled, bench_read_register, NULL);
+    loop.started_ms = started_ms;
+    loop.completed_ms = HAL_GetTick();
+    taskENTER_CRITICAL();
     motor_bench_diagnostics = diagnostics;
+    motor_bench_loop_diagnostics = loop;
+    taskEXIT_CRITICAL();
 }
 #endif
 
@@ -489,6 +541,13 @@ static void process_zero_request(void)
 void motor_bridge_init(void)
 {
     memset(&state, 0, sizeof(state));
+#if MOTOR_BENCH_JOINT7_POSVEL
+    /* NOLOAD storage contains arbitrary bytes after reset. No reader uses it
+     * until this initialization and meta version become visible. */
+    memset((void *)&motor_bench_diagnostics, 0, sizeof(motor_bench_diagnostics));
+    memset((void *)&motor_bench_loop_diagnostics, 0, sizeof(motor_bench_loop_diagnostics));
+    motor_bench_trace_init(&motor_bench_trace_meta, motor_bench_trace_records);
+#endif
     motor_v2_init(&state.control, boot_nonce());
     /* POS capabilities stay zero until each model/firmware is bench-qualified. */
     for (uint32_t i = 0; i < MOTOR_BRIDGE_JOINT_COUNT; ++i) {
@@ -610,6 +669,17 @@ bool motor_bridge_accept_command_v2(const MotorCommandV2 *command, uint32_t now_
                                         state.snapshot.last_command_sequence, now_ms);
     else { state.control.rejected_sequence = command->sequence; state.control.reject_code = error; }
     if (!error) {
+#if MOTOR_BENCH_JOINT7_POSVEL
+        if (command->active_joint_mask == 0x40U) {
+            motor_bench_trace_meta.armed = 1U;
+            MotorBenchTraceRecord marker = {now_ms,
+                motor_bench_trace_tag(MOTOR_BENCH_TRACE_ACCEPTED_V2, 7U, 0U, 0U),
+                command->sequence, command->mode | ((uint32_t)command->control_mode << 8) |
+                    (command->active_joint_mask << 16)};
+            motor_bench_trace_append(&motor_bench_trace_meta, motor_bench_trace_records,
+                                     &marker, now_ms);
+        }
+#endif
         state.have_disable = false;
         state.command_v2 = *command;
         state.using_v2 = true;
@@ -656,6 +726,9 @@ static void consume_feedback(uint32_t now_ms)
     uint32_t received_ms;
     uint8_t data[DAMIAO_DLC];
     while (fdcan1_get_rx_data_at(&can_id, data, &received_ms) == DAMIAO_DLC) {
+#if MOTOR_BENCH_JOINT7_POSVEL
+        bench_trace_can(MOTOR_BENCH_TRACE_RX, can_id, data, received_ms);
+#endif
         for (uint32_t i = 0U; i < MOTOR_BRIDGE_JOINT_COUNT; i++) {
             if (can_id == feedback_ids[i]) {
                 if (damiao_is_register_reply(data) || damiao_is_register_write_ack(data)) {
@@ -705,6 +778,8 @@ static bool enforce_joint7_bench_feedback(uint32_t now_ms, bool was_active)
         now_ms - state.received_feedback_ms[6], state.snapshot.position[6],
         state.snapshot.velocity[6], state.snapshot.effort[6]);
     if (!reason) return false;
+    motor_bench_trace_trigger(&motor_bench_trace_meta, motor_bench_trace_records,
+        MOTOR_BENCH_TRACE_TRIP, state.snapshot.last_command_sequence, reason, now_ms);
     if (!motor_bench_diagnostics.trip_reason) {
         motor_bench_diagnostics.trip_ms = now_ms;
         motor_bench_diagnostics.trip_position = state.snapshot.position[6];
@@ -723,6 +798,9 @@ static bool enforce_joint7_bench_feedback(uint32_t now_ms, bool was_active)
 static void control_step_locked(uint32_t now_ms)
 {
     uint8_t data[DAMIAO_DLC];
+#if MOTOR_BENCH_JOINT7_POSVEL
+    motor_bench_trace_tick(&motor_bench_trace_meta, now_ms);
+#endif
     if (state.disable_pending) (void)send_disable();
     /* Wait for actual CAN transmission before requesting post-stop feedback.
      * This is a nonblocking FIFO query, never a busy wait in the 4 ms loop. */
@@ -983,6 +1061,27 @@ void motor_bridge_get_zero_snapshot(MotorBridgeZeroSnapshot *snapshot)
     *snapshot = state.zero_snapshot;
     taskEXIT_CRITICAL();
 }
+
+#if MOTOR_BENCH_JOINT7_POSVEL
+void motor_bridge_get_bench_snapshot(MotorBenchSnapshot *snapshot)
+{
+    taskENTER_CRITICAL();
+    snapshot->admission = motor_bench_diagnostics;
+    snapshot->loop = motor_bench_loop_diagnostics;
+    snapshot->trace = motor_bench_trace_meta;
+    taskEXIT_CRITICAL();
+}
+
+uint32_t motor_bridge_copy_bench_trace(uint32_t start_sequence,
+    MotorBenchTraceRecord *output, uint32_t capacity, MotorBenchTracePage *page)
+{
+    taskENTER_CRITICAL();
+    uint32_t count = motor_bench_trace_copy(&motor_bench_trace_meta,
+        motor_bench_trace_records, start_sequence, output, capacity, page);
+    taskEXIT_CRITICAL();
+    return count;
+}
+#endif
 
 void motor_bridge_force_disable(uint16_t fault_code)
 {

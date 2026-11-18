@@ -82,5 +82,19 @@ int main(void)
     assert(motor_bench_feedback_reason(true, 0, MOTOR_BENCH_POSITION_MAX + 0.0031f, 0, 0) == 3);
     assert(motor_bench_feedback_reason(true, 0, 0.5f, -0.101f, 0) == 4);
     assert(motor_bench_feedback_reason(true, 0, 0.5f, 0, -0.301f) == 5);
+    MotorBenchLoopDiagnostics loop;
+    calls = 0;
+    motor_bench_collect_loop(&loop, false, read_register, NULL);
+    assert(loop.version == 1 && loop.complete && !loop.read_mask && !calls);
+    for (unsigned i = 0; i < MOTOR_BENCH_LOOP_REGISTER_COUNT; ++i) assert(loop.errors[i] == -6);
+    motor_bench_collect_loop(&loop, true, read_register, NULL);
+    assert(loop.complete && loop.read_mask == 0x1ff && calls == 9);
+    const uint8_t expected_rids[] = {20,24,25,26,27,28,32,33,34};
+    assert(!memcmp(motor_bench_loop_registers, expected_rids, sizeof(expected_rids)));
+    for (unsigned i = 0; i < MOTOR_BENCH_LOOP_REGISTER_COUNT; ++i) {
+        bad_rid = expected_rids[i];
+        motor_bench_collect_loop(&loop, true, read_register, NULL);
+        assert(loop.read_mask == (0x1ffU & ~(1U << i)) && loop.errors[i] == -3);
+    }
     puts("joint7 bench diagnostic admission tests passed");
 }

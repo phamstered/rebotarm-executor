@@ -41,6 +41,8 @@ static void fixture(void)
     tick_advancing=fail_send=false;
 #if MOTOR_BENCH_JOINT7_POSVEL
     memset((void *)&motor_bench_diagnostics,0,sizeof(motor_bench_diagnostics));
+    memset((void *)&motor_bench_loop_diagnostics,0,sizeof(motor_bench_loop_diagnostics));
+    motor_bench_trace_init(&motor_bench_trace_meta,motor_bench_trace_records);
 #endif
 }
 static MotorBridgeCommand disable(uint32_t sequence)
@@ -135,10 +137,30 @@ int main(void)
         float value=rid==5?-2.0f:rid==31?4.0f:rid==21?12.5f:rid==22?30.0f:rid==23?10.0f:1.0f;
         memcpy(f->data+4,&value,4);
     }
+    for(unsigned j=0;j<MOTOR_BENCH_LOOP_REGISTER_COUNT;++j) {
+        f=&received[rx_count++];memset(f,0,sizeof(*f));f->id=0x17;f->received_ms=80+j;
+        damiao_encode_register_read_cmd(7,motor_bench_loop_registers[j],f->data);
+        float value=j==0?10.0f:j==1?1000.0f:j==6?100.0f:0.0f;
+        memcpy(f->data+4,&value,4);
+    }
     initialize_joint7_bench();
     assert(motor_bench_diagnostics.complete && motor_bench_diagnostics.admitted_mask==0x40);
-    assert(motor_bench_diagnostics.read_mask==0xfff && tx_count==12);
+    assert(motor_bench_diagnostics.read_mask==0xfff && tx_count==21);
     assert(sent[11].data[3]==31 && motor_bench_float(motor_bench_diagnostics.raw[11])==4.0f);
+    assert(motor_bench_loop_diagnostics.complete && motor_bench_loop_diagnostics.read_mask==0x1ff);
+    assert(motor_bench_float(motor_bench_loop_diagnostics.raw[0])==10.0f);
+    MotorBenchSnapshot bench_snapshot; motor_bridge_get_bench_snapshot(&bench_snapshot);
+    assert(bench_snapshot.admission.magic==0x4a374233 && sizeof(bench_snapshot.admission)==148);
+    assert(bench_snapshot.loop.raw[1]==motor_bench_loop_diagnostics.raw[1]);
+    MotorBenchTracePage trace_page;MotorBenchTraceRecord trace_records[8];
+    uint32_t trace_cursor=0;bool exact_read_rx=false;
+    while(motor_bridge_copy_bench_trace(trace_cursor,trace_records,8,&trace_page)) {
+        for(unsigned j=0;j<trace_page.count;++j)
+            if(trace_records[j].ms==80 && (trace_records[j].tag>>18)==MOTOR_BENCH_TRACE_RX)
+                exact_read_rx=true;
+        trace_cursor=trace_page.first_sequence+trace_page.count;
+    }
+    assert(exact_read_rx); /* Capture CAN receive time, not dequeue time. */
     assert(state.control.pos_vel_supported_mask==0x40 && state.control.position_min[0]==0);
     assert(state.control.position_min[6]==MOTOR_BENCH_POSITION_MIN);
     for(unsigned j=0;j<tx_count;++j) {
@@ -146,10 +168,14 @@ int main(void)
         assert(sent[j].data[0]==7 && sent[j].data[2]==DAMIAO_REG_READ_MARKER);
     }
     /* Reuse the valid first eleven replies: an unread Deta must still fail closed. */
-    rx_pos=3;--rx_count;tx_count=0;tick_advancing=true;
+    rx_pos=3;rx_count=3+11;tx_count=0;tick_advancing=true;
     initialize_joint7_bench();assert(!state.control.pos_vel_supported_mask);
     assert(motor_bench_diagnostics.read_mask==0x7ff);
     assert(motor_bench_diagnostics.errors[11]==DAMIAO_ERR_TIMEOUT);
+    /* Extra loop reads failing never change the original admission outcome. */
+    rx_pos=3;rx_count=3+12;tx_count=0;
+    initialize_joint7_bench();assert(state.control.pos_vel_supported_mask==0x40);
+    assert(!motor_bench_loop_diagnostics.read_mask && motor_bench_loop_diagnostics.errors[0]==DAMIAO_ERR_TIMEOUT);
     state.drive_status[0]=DAMIAO_STATUS_ENABLED;tx_count=0;
     initialize_joint7_bench();assert(!state.control.pos_vel_supported_mask && tx_count==0);
     fixture();state.snapshot.position[6]=0.5f;fail_send=true;
@@ -158,20 +184,25 @@ int main(void)
     fixture();state.snapshot.position[6]=0.5f;tick_advancing=true;
     initialize_joint7_bench();assert(!state.control.pos_vel_supported_mask);
     assert(motor_bench_diagnostics.read_mask==0 && motor_bench_diagnostics.errors[0]==DAMIAO_ERR_TIMEOUT);
-    assert(clock_ms>=1300 && clock_ms<1600); /* Twelve bounded reads, starting at 100 ms. */
+    assert(clock_ms>=2200 && clock_ms<2600); /* Twenty-one bounded reads from 100 ms. */
     for(unsigned reason=1;reason<=5;++reason) {
         fixture();state.using_v2=true;state.have_command=true;state.snapshot.mode=1;
         state.command_v2.active_joint_mask=0x40;state.control.lease_id=4;
         state.control.control_modes[6]=2;state.control.pos_vel_supported_mask=0x40;
         state.snapshot.position[6]=0.5f;state.received_feedback_ms[6]=100;
+        motor_bench_trace_meta.armed=1;state.snapshot.last_command_sequence=49;
         if(reason==1) state.received_feedback_ms[6]=0;
         if(reason==2) state.snapshot.velocity[6]=NAN;
         if(reason==3) state.snapshot.position[6]=0.6f;
         if(reason==4) state.snapshot.velocity[6]=0.2f;
         if(reason==5) state.snapshot.effort[6]=0.4f;
-        motor_bridge_control_step(102);
+        clock_ms=102;motor_bridge_control_step(102);
         assert(state.snapshot.mode==3 && !state.control.lease_id && !state.control.pos_vel_supported_mask);
         assert(motor_bench_diagnostics.trip_reason==reason && tx_count==7);
+        assert(motor_bridge_copy_bench_trace(0,trace_records,8,&trace_page)>0);
+        assert((trace_records[0].tag>>18)==MOTOR_BENCH_TRACE_TRIP);
+        assert(trace_records[0].data0==49 && trace_records[0].data1==reason);
+        assert(trace_page.meta.trigger_kind==MOTOR_BENCH_TRACE_TRIP && trace_page.meta.trigger_ms==102);
         for(unsigned j=0;j<tx_count;++j) assert(sent[j].data[7]==0xfd);
         stop=disable(50);assert(motor_bridge_accept_command(&stop,103));
         assert(state.snapshot.fault_code!=0 && motor_bench_diagnostics.trip_reason==reason);
@@ -188,6 +219,67 @@ int main(void)
             assert(disabled_proven(now) && state.disable_ms==stopped_at);
         }
     }
+    /* The actual adapter records only joint7, arms on admitted V2, then keeps
+     * the first stop evidence. Publishing/copying cannot consume or reset it. */
+    fixture();
+    state.control.control_modes[6]=2;state.control.owner_source_id=5;
+    state.control.lease_id=7;state.control.selected_joint_mask=0x40;
+    state.control.pos_vel_supported_mask=0x40;
+    state.control.position_min[6]=MOTOR_BENCH_POSITION_MIN;
+    state.control.position_max[6]=MOTOR_BENCH_POSITION_MAX;
+    state.control.velocity_limit_max[6]=MOTOR_BENCH_VELOCITY_MAX;
+    state.snapshot.position[6]=0.5f;state.received_feedback_ms[6]=100;
+    stop=disable(7);assert(motor_bridge_accept_command(&stop,100));
+    motor_bridge_get_bench_snapshot(&bench_snapshot);
+    assert(!bench_snapshot.trace.armed && !bench_snapshot.trace.triggered);
+    state.control.lease_id=7;
+    c=(MotorCommandV2){.boot_id=42,.control_epoch=1,.source_id=5,.lease_id=7,
+        .sequence=8,.mode=1,.control_mode=2,.active_joint_mask=0x40};
+    c.position[6]=0.6f;c.velocity_limit[6]=0.02f;
+    assert(!motor_bridge_accept_command_v2(&c,100));
+    motor_bridge_get_bench_snapshot(&bench_snapshot);assert(!bench_snapshot.trace.armed);
+    c.position[6]=0.5f;assert(motor_bridge_accept_command_v2(&c,100));
+    /* The preflight's pending STOP must complete before the next control step. */
+    state.disable_pending=state.disable_tx_wait=false;
+    tx_count=0;motor_bridge_control_step(100);
+    const uint8_t expected_posvel[]={0,0,0,0x3f,0x0a,0xd7,0xa3,0x3c};
+    f=&received[rx_count++];memset(f,0,sizeof(*f));f->id=0x17;f->received_ms=98;
+    const uint8_t raw_feedback[]={0x17,0x85,0x1e,0x80,0x08,0,0,0};
+    memcpy(f->data,raw_feedback,8);clock_ms=104;motor_bridge_control_step(104);
+    fail_send=true;assert(!send_frame(0x107,(uint8_t *)expected_posvel));fail_send=false;
+    bool saw_accepted=false,saw_tx=false,saw_rx=false,saw_tx_error=false;
+    trace_cursor=0;
+    while(motor_bridge_copy_bench_trace(trace_cursor,trace_records,8,&trace_page)) {
+        for(unsigned j=0;j<trace_page.count;++j) {
+            MotorBenchTraceRecord *record=&trace_records[j];
+            unsigned kind=record->tag>>18;
+            assert(((record->tag>>15)&7)==7 && (record->tag&0xffc00000U)==0);
+            if(kind==MOTOR_BENCH_TRACE_ACCEPTED_V2) {
+                assert(record->data0==8 && record->data1==(1U|(2U<<8)|(64U<<16)));saw_accepted=true;
+            }
+            if(kind==MOTOR_BENCH_TRACE_TX_OK && (record->tag&0x7ff)==0x107 &&
+                !memcmp(&record->data0,expected_posvel,8)) saw_tx=true;
+            if(kind==MOTOR_BENCH_TRACE_RX) {
+                assert(record->ms==98 && !memcmp(&record->data0,raw_feedback,8));saw_rx=true;
+            }
+            if(kind==MOTOR_BENCH_TRACE_TX_ERROR) saw_tx_error=true;
+        }
+        trace_cursor=trace_page.first_sequence+trace_page.count;
+    }
+    assert(saw_accepted && saw_tx && saw_rx && saw_tx_error);
+    clock_ms=105;stop=disable(9);assert(motor_bridge_accept_command(&stop,105));
+    motor_bridge_get_bench_snapshot(&bench_snapshot);
+    assert(bench_snapshot.trace.armed && bench_snapshot.trace.triggered && !bench_snapshot.trace.frozen);
+    assert(bench_snapshot.trace.trigger_kind==MOTOR_BENCH_TRACE_STOP && bench_snapshot.trace.trigger_ms==105);
+    clock_ms=106;motor_bridge_control_step(106);
+    clock_ms=204;motor_bridge_control_step(204);
+    motor_bridge_get_bench_snapshot(&bench_snapshot);assert(!bench_snapshot.trace.frozen);
+    clock_ms=205;motor_bridge_control_step(205);
+    motor_bridge_get_bench_snapshot(&bench_snapshot);assert(bench_snapshot.trace.frozen);
+    uint32_t frozen_next=bench_snapshot.trace.next_sequence;
+    clock_ms=206;stop=disable(10);assert(motor_bridge_accept_command(&stop,206));
+    motor_bridge_control_step(206);motor_bridge_get_bench_snapshot(&bench_snapshot);
+    assert(bench_snapshot.trace.next_sequence==frozen_next && bench_snapshot.trace.trigger_ms==105);
 #endif
     puts("motor bridge V2 CAN tests passed");
 }

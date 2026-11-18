@@ -503,7 +503,9 @@ release implements the complete switching, admission and CAN path, exercised by
 host simulation with a qualified mask; it does not claim hardware qualification.
 
 The micro-ROS pools remain 10 publishers / 5 subscriptions / 1 service / 1 client;
-the application uses 6 / 4 / 1 / 0, with six executor handles. Static messages avoid
+the production application uses 6 / 4 / 1 / 0, with six executor handles. The
+opt-in joint7 bench build adds two publishers (8 / 4 / 1 / 0); it adds no
+subscriptions or service/executor handles. Static messages avoid
 per-frame allocations. Debug/Release cross-compilation and host tests do not prove
 250 Hz timing, RTOS stack high-water marks, XRCE delivery or motor behavior on a
 board; those remain bench checks before enabling POS support.
@@ -646,3 +648,100 @@ factor and describes MAX_SPD before the gearbox. Its suggested damping range
 2.5–20 (default 4) is tuning guidance, distinct from the register's allowed
 range. The bench readout independently checks Deta, without substituting Damp
 or MIT's application Kd. Verify the actual motor revision against the manual.
+
+
+### Bench diagnostics over ROS
+
+The explicitly enabled joint7 bench image also publishes two `std_msgs/msg/UInt32MultiArray`
+Topics with BEST_EFFORT / VOLATILE QoS. They are absent from production builds:
+
+- `/stm32/joint7_bench_snapshot`: at most 1 Hz; original J7B3 admission/trip
+  diagnostics, an additional startup-only register observation, trace metadata,
+  current/minimum FreeRTOS free heap bytes, micro-ROS task minimum unused
+  stack words, and the cumulative FDCAN1 RX queue overflow counter. These counters do not measure every control/safety task's stack.
+- `/stm32/joint7_bench_trace`: at most 20 Hz, up to eight records per page;
+  repeatedly exports the frozen retained window so a late subscriber can collect
+  all pages. Transport delivery is not guaranteed; the offline decoder detects
+  missing/conflicting pages rather than assuming completeness.
+
+Publishing occurs only in the micro-ROS task, after fresh verified all-axis
+DISABLE, with no enabled axis, no switching and no lease. Both Topics are
+suppressed during motion and the stop-proof interval. The real-time paths only
+copy bounded records; they never allocate, serialize, wait for ROS, or publish.
+Message backing arrays are static. A page copy holds the existing critical
+section for at most eight records (128 bytes). Readout cannot clear faults,
+change qualification, acquire a lease, send a command or restart a capture.
+
+After the existing twelve admission reads, startup observes joint7 RIDs
+`20,24,25,26,27,28,32,33,34` (Gr, I_BW, KP_ASR, KI_ASR, KP_APR, KI_APR,
+V_BW, IQ_c1, VL_c1). Each is a float32 bit pattern with an independent signed
+read result; the separate read mask and completion flag distinguish a successful
+zero from a missing value. Each read has the same 100 ms bound; these extra reads
+can add up to 0.9 s. They run only when startup feedback reports all drives
+DISABLED. Their success or numerical value does **not** change the original
+admission criteria or establish dynamic qualification. No register write or
+save operation is added. The original 148-byte J7B3 SWD layout is unchanged.
+
+Interpret parameters against the actual drive revision. The cited DM-J4310-2EC
+V1.1 manual V1.3, page 26, describes ACC/DEC as rotor-side **Krad/s²** in non-MIT
+modes. If that revision applies, nominal output acceleration is
+`1000 * ACC / Gr` (DEC is negative), not simply ACC in output rad/s². This is a
+parameter interpretation, not a measured acceleration guarantee. The same page
+labels the damping factor unused, unlike older general tuning guidance. A
+successful Deta read therefore does not prove that the running firmware uses it
+to limit overshoot. Record raw software/sub-version and loop values; never
+change Gr or assume that register validity qualifies low-speed POS_VEL.
+
+The 512-record ring occupies 8192 explicitly initialized NOLOAD bytes in RAM_D1,
+not DTCMRAM or the RTOS heap. Local production Debug/Release still link at
+122352/122344 DTCMRAM bytes with no trace allocation. The diagnostic bench
+Debug/Release images use 123288/123272 DTCMRAM bytes (94.06%/94.05%), 8192 RAM_D1
+bytes, and 26720 RAM_D2 bytes. These link sizes include static reservations;
+read the runtime counters as well before drawing conclusions about headroom.
+Records contain MCU milliseconds, a tag and the
+exact eight payload bytes. TX records identify the HAL enqueue result only:
+**TX_OK is not a wire-level TX-complete event or an execution acknowledgement**.
+No FDCAN FIFO/interrupt configuration is changed. RX records retain the existing
+ISR receive timestamp but are recorded when consumed by a task; records across
+TX/RX may consequently appear with non-monotonic timestamp order. A missing
+frame before the consumer cannot be reconstructed by this trace. Compare the RX
+queue overflow counter before/after a trial; it is distinct from ring overwrite
+and does not count other possible hardware or transport losses.
+
+Only joint7 CAN frames are recorded (motor IDs 7 / 0x107, addressed register
+requests on 0x7ff, and feedback 0x17), together with accepted V2, STOP and TRIP
+markers. The ring arms after the first accepted joint7 V2 command. Startup,
+preflight and configuration DISABLEs do not freeze it. The first subsequent
+active-to-DISABLE or bench trip triggers at most 100 ms or 32 additional records
+of tail capture, whichever occurs first, then freezes. Repeated DISABLE, ROS
+reconnect and later commands do not clear or reopen this first capture. This is
+one capture per boot; retain it before any independently justified restart.
+Overwritten records and stale/future page cursors are explicitly reported.
+
+`UInt32MultiArray.layout` is empty. `data` contains numeric uint32 words; all
+float32 and signed-error values are carried as their raw bits. The v1 layouts are:
+
+| Message | Word indices | Meaning |
+| --- | --- | --- |
+| Both | 0–6 | magic (`J7S1`=0x4a375331 or `J7T1`=0x4a375431), version=1, total word count, boot low/high, current MCU ms, reserved=0 |
+| Snapshot | 7–9 | free heap bytes, minimum ever free heap bytes, micro-ROS stack high-water words |
+| Snapshot | 10–15 | section lengths 37/23/11, cumulative FDCAN1 RX queue overflow, then two reserved zero words |
+| Snapshot | 16–52 | unchanged J7B3 admission/trip data, 37 words |
+| Snapshot | 53–75 | loop version, complete, read mask, start/end MCU ms, raw[9], signed errors[9] |
+| Snapshot | 76–86 | trace metadata, 11 words |
+| Trace | 7–17 | trace metadata, 11 words |
+| Trace | 18–23 | first page sequence, count (0–8), gap flag, ring capacity=512, record words=4, reserved=0 |
+| Trace | 24 onward | count records of `[MCU ms, tag, data0, data1]` |
+
+Trace metadata order is version, retained first sequence, next sequence, count,
+overwritten, armed, triggered, frozen, trigger kind, trigger MCU ms, tail count.
+Sequence arithmetic is unsigned modulo 2³². Tags encode CAN ID in bits 0–10,
+DLC in 11–14, axis in 15–17 (7), kind in 18–21, and zero in all higher bits.
+Kinds 1/2/3 are TX enqueue OK/error/RX; kinds 4/5/6 are accepted V2/STOP/TRIP.
+CAN bytes are packed little-endian in data0/data1. Markers contain sequence in
+data0 and mode|control_mode<<8|mask<<16, fault, or trip reason in data1.
+
+The offline decoder `scripts/decode_joint7_bench_ros.py` reads saved JSON/JSONL;
+it does not open ROS, serial or network connections. Keep original ROS messages
+alongside the decoded report. A complete retained trace still cannot prove
+unobserved peaks, missing ISR frames, actual wire transmission or safe motion.

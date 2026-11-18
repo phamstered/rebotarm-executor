@@ -32,6 +32,31 @@ typedef struct {
 } MotorBenchDiagnostics;
 typedef int (*MotorBenchRead)(uint8_t rid, uint32_t *value, void *context);
 
+/* Separate from J7B3: these are observations, not added admission criteria. */
+#define MOTOR_BENCH_LOOP_REGISTER_COUNT 9U
+static const uint8_t motor_bench_loop_registers[MOTOR_BENCH_LOOP_REGISTER_COUNT] =
+    {20, 24, 25, 26, 27, 28, 32, 33, 34};
+typedef struct {
+    uint32_t version, complete, read_mask, started_ms, completed_ms;
+    uint32_t raw[MOTOR_BENCH_LOOP_REGISTER_COUNT];
+    int32_t errors[MOTOR_BENCH_LOOP_REGISTER_COUNT];
+} MotorBenchLoopDiagnostics;
+
+static inline void motor_bench_collect_loop(MotorBenchLoopDiagnostics *d,
+    bool disabled, MotorBenchRead read_register, void *context)
+{
+    memset(d, 0, sizeof(*d));
+    d->version = 1U;
+    for (uint32_t i = 0U; i < MOTOR_BENCH_LOOP_REGISTER_COUNT; ++i) {
+        /* Not-read is distinct from a successful zero-valued register. */
+        d->errors[i] = -6; /* DAMIAO_ERR_NOT_DISABLED; no request was sent. */
+        if (!disabled) continue;
+        d->errors[i] = read_register(motor_bench_loop_registers[i], &d->raw[i], context);
+        if (d->errors[i] == 0) d->read_mask |= 1U << i;
+    }
+    d->complete = 1U;
+}
+
 /* Feedback stop thresholds, not a drive-internal current/torque limiter. */
 static inline uint32_t motor_bench_feedback_reason(bool valid, uint32_t age_ms,
     float position, float velocity, float effort)

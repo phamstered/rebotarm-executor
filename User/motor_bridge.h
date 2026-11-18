@@ -4,6 +4,21 @@
 #include <stdbool.h>
 #include <stdint.h>
 #include "motor_control_v2.h"
+#include "motor_bench.h"
+
+#if MOTOR_BENCH_JOINT7_POSVEL
+#include "motor_bench_trace.h"
+typedef struct {
+    MotorBenchDiagnostics admission;
+    MotorBenchLoopDiagnostics loop;
+    MotorBenchTraceMeta trace;
+} MotorBenchSnapshot;
+
+/* Read-only, bounded copies. No CAN requests, state reset or publication. */
+void motor_bridge_get_bench_snapshot(MotorBenchSnapshot *snapshot);
+uint32_t motor_bridge_copy_bench_trace(uint32_t start_sequence,
+    MotorBenchTraceRecord *output, uint32_t capacity, MotorBenchTracePage *page);
+#endif
 
 #define MOTOR_BRIDGE_JOINT_COUNT 7U
 #define MOTOR_BRIDGE_ACTIVE_JOINT_MASK 0x7FUL
