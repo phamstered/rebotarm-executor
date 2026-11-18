@@ -30,6 +30,9 @@
 #include "bsp_fdcan.h"
 #include "damiao_protocol.h"
 #include "motor_bridge.h"
+#if MOTOR_BENCH_JOINT7_POSVEL
+#include "motor_bench_ros.h"
+#endif
 
 // micro-ROS includes
 #include <stdbool.h>
@@ -718,6 +721,18 @@ static uint32_t published_zero_sequence = UINT32_MAX;
 static uint32_t published_zero_signature = UINT32_MAX;
 static uint32_t last_zero_publish_ms;
 static uint32_t last_diagnostics_publish_ms;
+#if MOTOR_BENCH_JOINT7_POSVEL
+static rcl_publisher_t bench_snapshot_publisher;
+static rcl_publisher_t bench_trace_publisher;
+static std_msgs__msg__UInt32MultiArray bench_snapshot_message;
+static std_msgs__msg__UInt32MultiArray bench_trace_message;
+static uint32_t bench_snapshot_words[MOTOR_BENCH_ROS_SNAPSHOT_WORDS];
+static uint32_t bench_trace_words[MOTOR_BENCH_ROS_TRACE_MAX_WORDS];
+static uint32_t last_bench_snapshot_ms;
+static uint32_t last_bench_poll_ms;
+static uint32_t last_bench_trace_ms;
+static uint32_t bench_trace_sequence;
+#endif
 
 enum {
   MICROROS_EXIT_NONE = 0U,
@@ -876,6 +891,63 @@ static void zero_set_callback(const void *message)
                                            request->data);
 }
 
+#if MOTOR_BENCH_JOINT7_POSVEL
+/* Low-priority ROS task only. Nothing is serialized/published in control/ISR
+ * paths. Export only after verified output-off, so tracing adds no motion USB
+ * load and cannot hold up the stop proof. Frozen pages repeat for late readers. */
+static void publish_bench_diagnostics(uint32_t now_ms)
+{
+  if ((uint32_t)(now_ms - last_bench_poll_ms) < 50U) return;
+  last_bench_poll_ms = now_ms;
+  MotorControlSnapshot control;
+  motor_bridge_get_control_snapshot(&control);
+  if (!control.disabled_verified || control.mode != MOTOR_MODE_DISABLE ||
+      control.enabled_joint_mask != 0U || control.control.switching ||
+      control.control.lease_id != 0U || control.control.boot_id == 0U) return;
+
+  MotorBenchSnapshot bench;
+  motor_bridge_get_bench_snapshot(&bench);
+  if (!bench.admission.complete || !bench.loop.complete) return;
+  if ((uint32_t)(now_ms - last_bench_snapshot_ms) >= 1000U) {
+    const MotorBenchRuntimeDiagnostics runtime = {
+      (uint32_t)xPortGetFreeHeapSize(),
+      (uint32_t)xPortGetMinimumEverFreeHeapSize(),
+      (uint32_t)uxTaskGetStackHighWaterMark(NULL),
+      fdcan1_get_rx_overflow_count()
+    };
+    size_t words = motor_bench_ros_encode_snapshot(bench_snapshot_words,
+      MOTOR_BENCH_ROS_SNAPSHOT_WORDS, control.control.boot_id, now_ms,
+      &bench.admission, &bench.loop, &bench.trace, &runtime);
+    if (words != 0U) {
+      bench_snapshot_message.data.size = words;
+      if (rcl_publish(&bench_snapshot_publisher, &bench_snapshot_message,
+                      NULL) != RCL_RET_OK) microros_diagnostics.publish_failure_count++;
+    }
+    last_bench_snapshot_ms = now_ms;
+  }
+  if (bench.trace.frozen &&
+      (uint32_t)(now_ms - last_bench_trace_ms) >= 50U) {
+    MotorBenchTraceRecord records[MOTOR_BENCH_TRACE_PAGE_MAX];
+    MotorBenchTracePage page;
+    (void)motor_bridge_copy_bench_trace(bench_trace_sequence, records,
+                                      MOTOR_BENCH_TRACE_PAGE_MAX, &page);
+    size_t words = motor_bench_ros_encode_trace(bench_trace_words,
+      MOTOR_BENCH_ROS_TRACE_MAX_WORDS, control.control.boot_id, now_ms,
+      &page, records);
+    if (words != 0U) {
+      bench_trace_message.data.size = words;
+      if (rcl_publish(&bench_trace_publisher, &bench_trace_message,
+                      NULL) == RCL_RET_OK) {
+        bench_trace_sequence = page.first_sequence + page.count;
+        if (bench_trace_sequence == page.meta.next_sequence)
+          bench_trace_sequence = page.meta.first_sequence;
+      } else microros_diagnostics.publish_failure_count++;
+    }
+    last_bench_trace_ms = now_ms;
+  }
+}
+#endif
+
 static void publish_timer_callback(rcl_timer_t *timer, int64_t last_call_time)
 {
   (void)last_call_time;
@@ -1018,10 +1090,22 @@ static void publish_timer_callback(rcl_timer_t *timer, int64_t last_call_time)
     }
     last_diagnostics_publish_ms = HAL_GetTick();
   }
+#if MOTOR_BENCH_JOINT7_POSVEL
+  publish_bench_diagnostics(HAL_GetTick());
+#endif
 }
 
 static bool init_ros_messages(void)
 {
+#if MOTOR_BENCH_JOINT7_POSVEL
+  if (!std_msgs__msg__UInt32MultiArray__init(&bench_snapshot_message) ||
+      !std_msgs__msg__UInt32MultiArray__init(&bench_trace_message)) return false;
+  /* Lifetime-long static backing; no message fini/reallocation is performed. */
+  bench_snapshot_message.data.data = bench_snapshot_words;
+  bench_snapshot_message.data.capacity = MOTOR_BENCH_ROS_SNAPSHOT_WORDS;
+  bench_trace_message.data.data = bench_trace_words;
+  bench_trace_message.data.capacity = MOTOR_BENCH_ROS_TRACE_MAX_WORDS;
+#endif
   if (!sensor_msgs__msg__JointState__init(&joint_state_message) ||
       !sensor_msgs__msg__JointState__init(&zero_state_message) ||
       !microros_stm32h723_bridge__msg__HardwareStatus__init(&status_message) ||
@@ -1124,6 +1208,12 @@ void StartMicrorosTask(void *argument)
     zero_state_publisher = rcl_get_zero_initialized_publisher();
     zero_status_publisher = rcl_get_zero_initialized_publisher();
     microros_diagnostics_publisher = rcl_get_zero_initialized_publisher();
+#if MOTOR_BENCH_JOINT7_POSVEL
+    bench_snapshot_publisher = rcl_get_zero_initialized_publisher();
+    bench_trace_publisher = rcl_get_zero_initialized_publisher();
+    bool bench_snapshot_publisher_ready = false;
+    bool bench_trace_publisher_ready = false;
+#endif
     bool initialized = false;
     bool support_ready = false;
     bool node_ready = false;
@@ -1191,6 +1281,16 @@ void StartMicrorosTask(void *argument)
           &microros_diagnostics_publisher, &node,
           ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, UInt32MultiArray),
           "/stm32/microros_diagnostics") == RCL_RET_OK;
+#if MOTOR_BENCH_JOINT7_POSVEL
+      bench_snapshot_publisher_ready = rclc_publisher_init_best_effort(
+          &bench_snapshot_publisher, &node,
+          ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, UInt32MultiArray),
+          "/stm32/joint7_bench_snapshot") == RCL_RET_OK;
+      bench_trace_publisher_ready = rclc_publisher_init_best_effort(
+          &bench_trace_publisher, &node,
+          ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, UInt32MultiArray),
+          "/stm32/joint7_bench_trace") == RCL_RET_OK;
+#endif
       timer_ready = rclc_timer_init_default(
         &timer, &support, RCL_MS_TO_NS(4U), publish_timer_callback) == RCL_RET_OK;
     }
@@ -1199,6 +1299,9 @@ void StartMicrorosTask(void *argument)
         zero_set_subscription_ready && joint_publisher_ready &&
         status_publisher_ready && zero_state_publisher_ready &&
         zero_status_publisher_ready && microros_diagnostics_publisher_ready &&
+#if MOTOR_BENCH_JOINT7_POSVEL
+        bench_snapshot_publisher_ready && bench_trace_publisher_ready &&
+#endif
         timer_ready) {
       executor_ready = rclc_executor_init(
         &executor, &support.context, 6U, &allocator) == RCL_RET_OK;
@@ -1224,6 +1327,12 @@ void StartMicrorosTask(void *argument)
       last_zero_publish_ms = 0U;
       last_control_publish_ms = 0U;
       last_diagnostics_publish_ms = 0U;
+#if MOTOR_BENCH_JOINT7_POSVEL
+      last_bench_snapshot_ms = 0U;
+      last_bench_poll_ms = 0U;
+      last_bench_trace_ms = 0U;
+      bench_trace_sequence = 0U;
+#endif
       microros_diagnostics.session_generation++;
       microros_diagnostics.consecutive_ping_failures = 0U;
       microros_diagnostics.consecutive_spin_failures = 0U;
@@ -1296,6 +1405,10 @@ void StartMicrorosTask(void *argument)
     if (subscription_ready) fini_result = rcl_subscription_fini(&subscription, &node);
     if (zero_set_subscription_ready) fini_result = rcl_subscription_fini(&zero_set_subscription, &node);
     if (zero_get_subscription_ready) fini_result = rcl_subscription_fini(&zero_get_subscription, &node);
+#if MOTOR_BENCH_JOINT7_POSVEL
+    if (bench_trace_publisher_ready) fini_result = rcl_publisher_fini(&bench_trace_publisher, &node);
+    if (bench_snapshot_publisher_ready) fini_result = rcl_publisher_fini(&bench_snapshot_publisher, &node);
+#endif
     if (microros_diagnostics_publisher_ready) fini_result = rcl_publisher_fini(&microros_diagnostics_publisher, &node);
     if (zero_status_publisher_ready) fini_result = rcl_publisher_fini(&zero_status_publisher, &node);
     if (zero_state_publisher_ready) fini_result = rcl_publisher_fini(&zero_state_publisher, &node);
