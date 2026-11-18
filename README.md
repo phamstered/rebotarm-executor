@@ -49,6 +49,7 @@ V2 控制、异步切换和真实停机证明见[接口文档](docs/ros2-interfa
 POS_VEL 支持掩码默认 0，须完成逐型号/固件台架验证后才可开放。当前本地 Debug 链接占用约 93% DTCMRAM；运行时栈/堆余量仍需按接口文档完成台架测量。
 首次 joint7 验证可使用默认关闭的[受限台架构建](docs/ros2-interface.md#joint7-bench-image)，它不改变生产资格表，必须显式指定位置窗口和速度上限。
 台架镜像可经 ROS 导出只读启动参数和有界 joint7 CAN 记录，详见[诊断接口](docs/ros2-interface.md#bench-diagnostics-over-ros)。诊断不改写参数、不自动使能，发送入队记录不等于线侧完成或运动验收通过。
+台架还提供默认不执行的[临时加速度事务](docs/ros2-interface.md#bench-volatile-acceleration-profile)：仅允许 joint7 固定 ACC 参数及原值恢复，独立读回成功后才开放 POS_VEL 租约；不保存驱动 Flash。MCU 重启不等于电机参数恢复。
 
 ```bash
 # 配置与编译（Debug）

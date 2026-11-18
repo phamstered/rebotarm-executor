@@ -60,6 +60,11 @@ jobs:
         run: |
           python3 scripts/test_joint7_bench.py
           python3 scripts/test_joint7_bench_ros.py
+          python3 scripts/test_joint7_bench_profile.py
+          cc -std=c11 -Wall -Wextra -Werror -IUser -DMOTOR_BENCH_JOINT7_POSVEL=1 -DMOTOR_BENCH_POSITION_MIN=0.48f -DMOTOR_BENCH_POSITION_MAX=0.51f -DMOTOR_BENCH_VELOCITY_MAX=0.05f scripts/test_motor_bench_profile.c -o /tmp/motor-bench-profile-test
+          /tmp/motor-bench-profile-test
+          cc -std=c11 -Wall -Wextra -Werror -Iscripts/host_stubs -IUser -DMOTOR_BENCH_JOINT7_POSVEL=1 -DMOTOR_BENCH_POSITION_MIN=0.48f -DMOTOR_BENCH_POSITION_MAX=0.51f -DMOTOR_BENCH_VELOCITY_MAX=0.05f scripts/test_motor_bridge_profile.c User/motor_control_v2.c User/damiao_protocol.c -lm -o /tmp/motor-bridge-profile-test
+          /tmp/motor-bridge-profile-test
           cc -std=c11 -Wall -Wextra -Werror -IUser scripts/test_motor_bench_trace.c -o /tmp/motor-bench-trace-test
           /tmp/motor-bench-trace-test
           cc -std=c11 -Wall -Wextra -Werror -IUser -DMOTOR_BENCH_JOINT7_POSVEL=1 -DMOTOR_BENCH_POSITION_MIN=0.48f -DMOTOR_BENCH_POSITION_MAX=0.51f -DMOTOR_BENCH_VELOCITY_MAX=0.05f scripts/test_motor_bench.c -o /tmp/motor-bench-test
