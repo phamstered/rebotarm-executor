@@ -105,6 +105,7 @@ static DamiaoMotorState motor_state[MOTOR_BRIDGE_JOINT_COUNT];
 /* Retained as a global ELF symbol for read-only SWD inspection after startup. */
 volatile MotorBenchDiagnostics motor_bench_diagnostics;
 volatile MotorBenchLoopDiagnostics motor_bench_loop_diagnostics;
+volatile MotorBenchCalibrationDiagnostics motor_bench_calibration_diagnostics;
 /* The linker places only this explicitly initialized array in RAM_D1. */
 static MotorBenchTraceRecord motor_bench_trace_records[MOTOR_BENCH_TRACE_CAPACITY]
 #if defined(__arm__) || defined(__thumb__)
@@ -433,6 +434,7 @@ static void initialize_joint7_bench(void)
 {
     MotorBenchDiagnostics diagnostics;
     MotorBenchLoopDiagnostics loop;
+    MotorBenchCalibrationDiagnostics calibration;
     state.control.pos_vel_supported_mask = 0U;
     memset(state.control.position_min, 0, sizeof(state.control.position_min));
     memset(state.control.position_max, 0, sizeof(state.control.position_max));
@@ -451,9 +453,14 @@ static void initialize_joint7_bench(void)
     motor_bench_collect_loop(&loop, disabled, bench_read_register, NULL);
     loop.started_ms = started_ms;
     loop.completed_ms = HAL_GetTick();
+    started_ms = HAL_GetTick();
+    motor_bench_collect_calibration(&calibration, disabled, bench_read_register, NULL);
+    calibration.started_ms = started_ms;
+    calibration.completed_ms = HAL_GetTick();
     taskENTER_CRITICAL();
     motor_bench_diagnostics = diagnostics;
     motor_bench_loop_diagnostics = loop;
+    motor_bench_calibration_diagnostics = calibration;
     taskEXIT_CRITICAL();
 }
 #endif
@@ -578,6 +585,9 @@ void motor_bridge_init(void)
      * until this initialization and meta version become visible. */
     memset((void *)&motor_bench_diagnostics, 0, sizeof(motor_bench_diagnostics));
     memset((void *)&motor_bench_loop_diagnostics, 0, sizeof(motor_bench_loop_diagnostics));
+    /* Preserve explicit not-read errors if initialization returns before the
+     * bounded calibration collection can run. */
+    motor_bench_init_calibration((MotorBenchCalibrationDiagnostics *)&motor_bench_calibration_diagnostics);
     motor_bench_trace_init(&motor_bench_trace_meta, motor_bench_trace_records);
 #endif
     motor_v2_init(&state.control, boot_nonce());
@@ -1175,6 +1185,7 @@ void motor_bridge_get_bench_snapshot(MotorBenchSnapshot *snapshot)
     snapshot->admission = motor_bench_diagnostics;
     snapshot->loop = motor_bench_loop_diagnostics;
     snapshot->trace = motor_bench_trace_meta;
+    snapshot->calibration = motor_bench_calibration_diagnostics;
     taskEXIT_CRITICAL();
 }
 

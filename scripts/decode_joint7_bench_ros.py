@@ -3,7 +3,7 @@
 
 Input: {"layout":{"dim":[],"data_offset":0},"data":[uint32,...]} or
 {"topic":"/stm32/joint7_bench_trace","msg":{...}}. A JSON array of messages
-is also accepted. Snapshot-only files are valid but prove no captured trace.
+is also accepted. Snapshot/calibration-only files prove no captured trace.
 Trace captures require a frozen, complete retained window; overwritten history
 is reported as lost. HAL TX enqueue is never evidence of wire completion.
 """
@@ -17,16 +17,26 @@ from decode_joint7_bench import decode_dump
 
 SNAPSHOT_MAGIC = 0x4A375331
 TRACE_MAGIC = 0x4A375431
+CALIBRATION_MAGIC = 0x4A374331
 SNAPSHOT_WORDS = 87
 TRACE_HEADER_WORDS = 24
+CALIBRATION_WORDS = 29
 MASK32 = 0xFFFFFFFF
 TOPICS = {SNAPSHOT_MAGIC: '/stm32/joint7_bench_snapshot',
-          TRACE_MAGIC: '/stm32/joint7_bench_trace'}
+          TRACE_MAGIC: '/stm32/joint7_bench_trace',
+          CALIBRATION_MAGIC: '/stm32/joint7_bench_calibration'}
 # DM-J4310-2EC V1.1 manual v1.3 p18: RID20 Gr is a read-only float gear ratio.
 # This observation alone does not identify or qualify the attached motor.
 LOOP_REGISTERS = [('Gr', 20), ('I_BW', 24), ('KP_ASR', 25), ('KI_ASR', 26),
                   ('KP_APR', 27), ('KI_APR', 28), ('V_BW', 32),
                   ('IQ_c1', 33), ('VL_c1', 34)]
+# Fixed startup read whitelist; these observations neither run calibration nor
+# establish motor identity, valid tuning, or permission to move. TIMEOUT is u32
+# in 50 us units and NPP is u32; neither may be decoded as float bits.
+CALIBRATION_REGISTERS = [('TIMEOUT', 9, 'uint32'), ('Inertia', 12, 'float32'),
+                         ('NPP', 16, 'uint32'), ('Rs', 17, 'float32'),
+                         ('Ls', 18, 'float32'), ('Flux', 19, 'float32'),
+                         ('KT_Value', 1, 'float32'), ('GREF', 30, 'float32')]
 META_NAMES = ('version', 'first_sequence', 'next_sequence', 'count', 'overwritten',
               'armed', 'triggered', 'frozen', 'trigger_kind', 'trigger_ms', 'tail_count')
 KINDS = {1: 'tx_enqueue_ok', 2: 'tx_enqueue_error', 3: 'rx',
@@ -163,6 +173,28 @@ def decode_message(message):
                                 started_ms=loop[3], completed_ms=loop[4], registers=registers),
                       trace_meta=decode_meta(words[76:87]))
         return result
+    if words[0] == CALIBRATION_MAGIC:
+        require(len(words) == CALIBRATION_WORDS, 'calibration must contain exactly 29 words')
+        require(words[7] == 0, 'calibration reserved word must be zero')
+        calibration = words[8:29]
+        require(calibration[0] == 1, 'unsupported calibration diagnostic version')
+        require(calibration[1] in (0, 1) and calibration[2] & ~0xFF == 0,
+                'invalid calibration flags/mask')
+        registers = {}
+        for index, (name, rid, data_type) in enumerate(CALIBRATION_REGISTERS):
+            raw, error = calibration[5 + index], signed(calibration[13 + index])
+            read_ok = bool(calibration[2] & (1 << index))
+            require(not read_ok or error == 0,
+                    'calibration successful read bit has nonzero error')
+            value = raw if data_type == 'uint32' else float_bits(raw)
+            registers[name] = dict(rid=rid, data_type=data_type, raw_hex=f'0x{raw:08x}',
+                                   error=error, read_ok=read_ok, value=value,
+                                   value_valid=read_ok and isinstance(value, (float, int)))
+        result.update(kind='calibration', calibration_raw_words=calibration,
+                      calibration=dict(version=calibration[0], complete=calibration[1],
+                                       read_mask=calibration[2], started_ms=calibration[3],
+                                       completed_ms=calibration[4], registers=registers))
+        return result
     require(len(words) >= TRACE_HEADER_WORDS, 'truncated trace header')
     require(words[21:24] == [512, 4, 0], 'invalid trace capacity, record size, or reserved word')
     count = words[19]
@@ -192,16 +224,20 @@ def decode_capture(messages):
     require(bool(decoded), 'empty capture')
     require(len({message['boot_id'] for message in decoded}) == 1, 'mixed boot IDs in capture')
     snapshots = [message for message in decoded if message['kind'] == 'snapshot']
+    calibrations = [message for message in decoded if message['kind'] == 'calibration']
     pages = [message for message in decoded if message['kind'] == 'trace']
-    result = dict(boot_id=decoded[0]['boot_id'], snapshots=snapshots,
+    result = dict(boot_id=decoded[0]['boot_id'], snapshots=snapshots, calibrations=calibrations,
                   transmission_completion_proven=False, motion_success_proven=False,
                   note='TX enqueue is not wire completion; this capture is not motion qualification. '
                        'Ring overwrite and CAN RX queue overflow are separate losses; compare '
-                       'the cumulative overflow counter before and after a test.')
+                       'the cumulative overflow counter before and after a test. '
+                       'Calibration diagnostics are startup read observations; complete means '
+                       'collection ended, not calibration success or motion admission.')
     if not pages:
         result['trace'] = dict(status='not_captured', retained_window_complete=False)
         return result
-    frozen = [message['trace_meta'] for message in decoded if message['trace_meta']['frozen']]
+    frozen = [message['trace_meta'] for message in snapshots + pages
+              if message['trace_meta']['frozen']]
     require(bool(frozen), 'trace is not frozen; acquisition completeness cannot be established')
     final = frozen[-1]
     require(all(meta == final for meta in frozen), 'conflicting frozen trace metadata')

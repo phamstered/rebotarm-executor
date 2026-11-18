@@ -7,6 +7,19 @@ static int bad_rid = -1;
 /* Recorded joint7 values; Deta must be read separately from physical Damp. */
 static float damp = 0.000212438f, acc = 2.0f, dec = -2.0f;
 static float max_spd = 600.0f, vmax = 30.0f, deta = 4.0f;
+static uint32_t calibration_values[] = {
+    UINT32_MAX, 0x37e501f9U, 14U, 0x3f19897aU, 0x39551d0eU, 0x3b900943U, 0U, 0x3f800000U
+};
+static int read_calibration(uint8_t rid, uint32_t *value, void *context)
+{
+    (void)context;
+    assert(calls < MOTOR_BENCH_CALIBRATION_REGISTER_COUNT);
+    assert(rid == motor_bench_calibration_registers[calls]);
+    unsigned index = calls++;
+    if (rid == bad_rid) return -3;
+    *value = calibration_values[index];
+    return 0;
+}
 static int read_register(uint8_t rid, uint32_t *value, void *context)
 {
     (void)context;
@@ -132,6 +145,43 @@ int main(void)
         bad_rid = expected_rids[i];
         motor_bench_collect_loop(&loop, true, read_register, NULL);
         assert(loop.read_mask == (0x1ffU & ~(1U << i)) && loop.errors[i] == -3);
+    }
+    /* The independent calibration snapshot preserves raw values (including
+     * legitimate u32 max/float zero and nonfinite floats) without qualifying. */
+    MotorBenchCalibrationDiagnostics calibration;
+    assert(sizeof(calibration) == 84U);
+    const uint8_t expected_calibration_rids[] = {9,12,16,17,18,19,1,30};
+    assert(!memcmp(motor_bench_calibration_registers, expected_calibration_rids,
+                   sizeof(expected_calibration_rids)));
+    memset(&calibration, 0xff, sizeof(calibration));
+    motor_bench_init_calibration(&calibration);
+    assert(calibration.version == 1U && !calibration.complete && !calibration.read_mask);
+    for (unsigned i = 0; i < MOTOR_BENCH_CALIBRATION_REGISTER_COUNT; ++i)
+        assert(calibration.errors[i] == -6 && calibration.raw[i] == 0U);
+    calls = 0;
+    motor_bench_collect_calibration(&calibration, false, NULL, NULL);
+    assert(calibration.complete && !calibration.read_mask && !calls);
+    for (unsigned i = 0; i < MOTOR_BENCH_CALIBRATION_REGISTER_COUNT; ++i)
+        assert(calibration.errors[i] == -6);
+    bad_rid = -1;
+    motor_bench_collect_calibration(&calibration, true, read_calibration, NULL);
+    assert(calibration.complete && calibration.read_mask == 0xffU && calls == 8U);
+    assert(!memcmp(calibration.raw, calibration_values, sizeof(calibration_values)));
+    assert(calibration.raw[0] == UINT32_MAX && calibration.raw[2] == 14U &&
+           calibration.raw[6] == 0U);
+    for (unsigned i = 0; i < MOTOR_BENCH_CALIBRATION_REGISTER_COUNT; ++i) {
+        bad_rid = expected_calibration_rids[i]; calls = 0;
+        motor_bench_collect_calibration(&calibration, true, read_calibration, NULL);
+        assert(calls == 8U && calibration.read_mask == (0xffU & ~(1U << i)));
+        assert(calibration.errors[i] == -3 && calibration.raw[i] == 0U);
+    }
+    bad_rid = -1;
+    const uint32_t nonfinite[] = {0x7fc00001U, 0x7f800000U, 0xff800000U};
+    for (unsigned i = 0; i < sizeof(nonfinite) / sizeof(*nonfinite); ++i) {
+        calls = 0; calibration_values[1] = nonfinite[i];
+        motor_bench_collect_calibration(&calibration, true, read_calibration, NULL);
+        assert(calibration.read_mask == 0xffU && calibration.errors[1] == 0);
+        assert(calibration.raw[1] == nonfinite[i]);
     }
     puts("joint7 bench diagnostic admission tests passed");
 }

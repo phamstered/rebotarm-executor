@@ -14,6 +14,7 @@
 #define MOTOR_BENCH_ROS_VERSION 1U
 #define MOTOR_BENCH_ROS_SNAPSHOT_MAGIC 0x4a375331U /* J7S1 */
 #define MOTOR_BENCH_ROS_TRACE_MAGIC 0x4a375431U /* J7T1 */
+#define MOTOR_BENCH_ROS_CALIBRATION_MAGIC 0x4a374331U /* J7C1 */
 #define MOTOR_BENCH_ROS_SNAPSHOT_HEADER_WORDS 16U
 #define MOTOR_BENCH_ROS_ADMISSION_WORDS 37U
 #define MOTOR_BENCH_ROS_LOOP_WORDS 23U
@@ -22,6 +23,8 @@
 #define MOTOR_BENCH_ROS_TRACE_HEADER_WORDS 24U
 #define MOTOR_BENCH_ROS_RECORD_WORDS 4U
 #define MOTOR_BENCH_ROS_TRACE_MAX_WORDS 56U
+#define MOTOR_BENCH_ROS_CALIBRATION_HEADER_WORDS 8U
+#define MOTOR_BENCH_ROS_CALIBRATION_WORDS 29U
 
 typedef struct {
     uint32_t free_heap_bytes;
@@ -34,6 +37,8 @@ _Static_assert(sizeof(float) == 4U, "bench float32 ABI");
 _Static_assert(sizeof(MotorBenchDiagnostics) == 148U, "preserve J7B3 ABI");
 _Static_assert(MOTOR_BENCH_LOOP_REGISTER_COUNT == 9U, "wire v1 loop RID count");
 _Static_assert(sizeof(MotorBenchLoopDiagnostics) == 92U, "loop wire ABI");
+_Static_assert(MOTOR_BENCH_CALIBRATION_REGISTER_COUNT == 8U, "wire v1 calibration RID count");
+_Static_assert(sizeof(MotorBenchCalibrationDiagnostics) == 84U, "calibration wire ABI");
 
 static inline void motor_bench_ros_meta(uint32_t *out, const MotorBenchTraceMeta *m)
 {
@@ -80,6 +85,25 @@ static inline size_t motor_bench_ros_encode_snapshot(uint32_t *out, size_t capac
     memcpy(out + 53U, loop, sizeof(*loop));
     motor_bench_ros_meta(out + 76U, trace);
     return MOTOR_BENCH_ROS_SNAPSHOT_WORDS;
+}
+
+/* Separate startup observations preserve the historical snapshot/trace ABI.
+ * Common words 0..6 as above; word 7 is reserved=0. Words 8..28 contain
+ * version, complete, read mask, start/end ticks, raw[8], signed errors[8].
+ * Completion means collection ended, not that reads or calibration succeeded. */
+static inline size_t motor_bench_ros_encode_calibration(uint32_t *out, size_t capacity,
+    uint64_t boot_id, uint32_t now_ms, const MotorBenchCalibrationDiagnostics *calibration)
+{
+    if (!out || !calibration || capacity < MOTOR_BENCH_ROS_CALIBRATION_WORDS) return 0U;
+    memset(out, 0, MOTOR_BENCH_ROS_CALIBRATION_WORDS * sizeof(*out));
+    out[0] = MOTOR_BENCH_ROS_CALIBRATION_MAGIC;
+    out[1] = MOTOR_BENCH_ROS_VERSION;
+    out[2] = MOTOR_BENCH_ROS_CALIBRATION_WORDS;
+    out[3] = (uint32_t)boot_id;
+    out[4] = (uint32_t)(boot_id >> 32);
+    out[5] = now_ms;
+    memcpy(out + MOTOR_BENCH_ROS_CALIBRATION_HEADER_WORDS, calibration, sizeof(*calibration));
+    return MOTOR_BENCH_ROS_CALIBRATION_WORDS;
 }
 
 /* Trace words 7..17: metadata; 18: page start sequence; 19: page count;
