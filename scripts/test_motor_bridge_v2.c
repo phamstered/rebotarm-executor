@@ -43,6 +43,10 @@ static void fixture(void)
     memset((void *)&motor_bench_diagnostics,0,sizeof(motor_bench_diagnostics));
     memset((void *)&motor_bench_loop_diagnostics,0,sizeof(motor_bench_loop_diagnostics));
     motor_bench_trace_init(&motor_bench_trace_meta,motor_bench_trace_records);
+    motor_bench_profile_init(&motor_bench_profile,42);
+    /* These existing adapter scenarios start with already-proven test profile. */
+    motor_bench_profile.status.result=MBP_APPLIED;
+    motor_bench_profile.status.applied_verified=1;
 #endif
 }
 static MotorBridgeCommand disable(uint32_t sequence)
@@ -134,7 +138,7 @@ int main(void)
     for(unsigned j=0;j<MOTOR_BENCH_REGISTER_COUNT;++j) {
         f=&received[rx_count++];memset(f,0,sizeof(*f));f->id=0x17;
         uint8_t rid=motor_bench_registers[j];damiao_encode_register_read_cmd(7,rid,f->data);
-        float value=rid==5?-2.0f:rid==31?4.0f:rid==21?12.5f:rid==22?30.0f:rid==23?10.0f:1.0f;
+        float value=rid==4?2.0f:rid==5?-2.0f:rid==31?4.0f:rid==21?12.5f:rid==22?30.0f:rid==23?10.0f:1.0f;
         memcpy(f->data+4,&value,4);
     }
     for(unsigned j=0;j<MOTOR_BENCH_LOOP_REGISTER_COUNT;++j) {

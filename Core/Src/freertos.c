@@ -724,6 +724,11 @@ static uint32_t last_diagnostics_publish_ms;
 #if MOTOR_BENCH_JOINT7_POSVEL
 static rcl_publisher_t bench_snapshot_publisher;
 static rcl_publisher_t bench_trace_publisher;
+static rcl_publisher_t bench_profile_publisher;
+static std_msgs__msg__UInt32MultiArray bench_profile_request_message;
+static std_msgs__msg__UInt32MultiArray bench_profile_status_message;
+static uint32_t bench_profile_request_words[MOTOR_BENCH_PROFILE_REQUEST_WORDS];
+static uint32_t bench_profile_status_words[MOTOR_BENCH_PROFILE_STATUS_WORDS];
 static std_msgs__msg__UInt32MultiArray bench_snapshot_message;
 static std_msgs__msg__UInt32MultiArray bench_trace_message;
 static uint32_t bench_snapshot_words[MOTOR_BENCH_ROS_SNAPSHOT_WORDS];
@@ -892,6 +897,15 @@ static void zero_set_callback(const void *message)
 }
 
 #if MOTOR_BENCH_JOINT7_POSVEL
+static void bench_profile_callback(const void *message)
+{
+  const std_msgs__msg__UInt32MultiArray *input = message;
+  MotorBenchProfileRequest request;
+  if (input->layout.dim.size != 0U || input->layout.data_offset != 0U) return;
+  if (motor_bench_profile_decode_request(input->data.data, input->data.size, &request))
+    (void)motor_bridge_bench_profile_request(&request, HAL_GetTick());
+}
+
 /* Low-priority ROS task only. Nothing is serialized/published in control/ISR
  * paths. Export only after verified output-off, so tracing adds no motion USB
  * load and cannot hold up the stop proof. Frozen pages repeat for late readers. */
@@ -904,6 +918,16 @@ static void publish_bench_diagnostics(uint32_t now_ms)
   if (!control.disabled_verified || control.mode != MOTOR_MODE_DISABLE ||
       control.enabled_joint_mask != 0U || control.control.switching ||
       control.control.lease_id != 0U || control.control.boot_id == 0U) return;
+
+  MotorBenchProfileStatus profile;
+  motor_bridge_get_bench_profile_status(&profile);
+  size_t profile_words = motor_bench_profile_encode_status(bench_profile_status_words,
+    MOTOR_BENCH_PROFILE_STATUS_WORDS, &profile, now_ms);
+  if (profile_words != 0U) {
+    bench_profile_status_message.data.size = profile_words;
+    if (rcl_publish(&bench_profile_publisher, &bench_profile_status_message,
+                    NULL) != RCL_RET_OK) microros_diagnostics.publish_failure_count++;
+  }
 
   MotorBenchSnapshot bench;
   motor_bridge_get_bench_snapshot(&bench);
@@ -1099,12 +1123,18 @@ static bool init_ros_messages(void)
 {
 #if MOTOR_BENCH_JOINT7_POSVEL
   if (!std_msgs__msg__UInt32MultiArray__init(&bench_snapshot_message) ||
-      !std_msgs__msg__UInt32MultiArray__init(&bench_trace_message)) return false;
+      !std_msgs__msg__UInt32MultiArray__init(&bench_trace_message) ||
+      !std_msgs__msg__UInt32MultiArray__init(&bench_profile_request_message) ||
+      !std_msgs__msg__UInt32MultiArray__init(&bench_profile_status_message)) return false;
   /* Lifetime-long static backing; no message fini/reallocation is performed. */
   bench_snapshot_message.data.data = bench_snapshot_words;
   bench_snapshot_message.data.capacity = MOTOR_BENCH_ROS_SNAPSHOT_WORDS;
   bench_trace_message.data.data = bench_trace_words;
   bench_trace_message.data.capacity = MOTOR_BENCH_ROS_TRACE_MAX_WORDS;
+  bench_profile_request_message.data.data = bench_profile_request_words;
+  bench_profile_request_message.data.capacity = MOTOR_BENCH_PROFILE_REQUEST_WORDS;
+  bench_profile_status_message.data.data = bench_profile_status_words;
+  bench_profile_status_message.data.capacity = MOTOR_BENCH_PROFILE_STATUS_WORDS;
 #endif
   if (!sensor_msgs__msg__JointState__init(&joint_state_message) ||
       !sensor_msgs__msg__JointState__init(&zero_state_message) ||
@@ -1213,6 +1243,10 @@ void StartMicrorosTask(void *argument)
     bench_trace_publisher = rcl_get_zero_initialized_publisher();
     bool bench_snapshot_publisher_ready = false;
     bool bench_trace_publisher_ready = false;
+    bench_profile_publisher = rcl_get_zero_initialized_publisher();
+    rcl_subscription_t bench_profile_subscription = rcl_get_zero_initialized_subscription();
+    bool bench_profile_publisher_ready = false;
+    bool bench_profile_subscription_ready = false;
 #endif
     bool initialized = false;
     bool support_ready = false;
@@ -1290,6 +1324,14 @@ void StartMicrorosTask(void *argument)
           &bench_trace_publisher, &node,
           ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, UInt32MultiArray),
           "/stm32/joint7_bench_trace") == RCL_RET_OK;
+      bench_profile_publisher_ready = rclc_publisher_init_best_effort(
+          &bench_profile_publisher, &node,
+          ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, UInt32MultiArray),
+          "/stm32/joint7_bench_profile/status") == RCL_RET_OK;
+      bench_profile_subscription_ready = rclc_subscription_init_best_effort(
+          &bench_profile_subscription, &node,
+          ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, UInt32MultiArray),
+          "/stm32/joint7_bench_profile/request") == RCL_RET_OK;
 #endif
       timer_ready = rclc_timer_init_default(
         &timer, &support, RCL_MS_TO_NS(4U), publish_timer_callback) == RCL_RET_OK;
@@ -1301,10 +1343,17 @@ void StartMicrorosTask(void *argument)
         zero_status_publisher_ready && microros_diagnostics_publisher_ready &&
 #if MOTOR_BENCH_JOINT7_POSVEL
         bench_snapshot_publisher_ready && bench_trace_publisher_ready &&
+        bench_profile_publisher_ready && bench_profile_subscription_ready &&
 #endif
         timer_ready) {
       executor_ready = rclc_executor_init(
-        &executor, &support.context, 6U, &allocator) == RCL_RET_OK;
+        &executor, &support.context,
+#if MOTOR_BENCH_JOINT7_POSVEL
+        7U,
+#else
+        6U,
+#endif
+        &allocator) == RCL_RET_OK;
     }
     if (executor_ready &&
         rclc_executor_add_subscription(&executor, &subscription_v2, &command_v2_message,
@@ -1319,6 +1368,11 @@ void StartMicrorosTask(void *argument)
         rclc_executor_add_subscription(&executor, &zero_set_subscription,
                                        &zero_set_message, zero_set_callback,
                                        ON_NEW_DATA) == RCL_RET_OK &&
+#if MOTOR_BENCH_JOINT7_POSVEL
+        rclc_executor_add_subscription(&executor, &bench_profile_subscription,
+                                       &bench_profile_request_message, bench_profile_callback,
+                                       ON_NEW_DATA) == RCL_RET_OK &&
+#endif
         rclc_executor_add_timer(&executor, &timer) == RCL_RET_OK) {
       initialized = true;
       reconnect_delay_ms = 250U;
@@ -1406,6 +1460,8 @@ void StartMicrorosTask(void *argument)
     if (zero_set_subscription_ready) fini_result = rcl_subscription_fini(&zero_set_subscription, &node);
     if (zero_get_subscription_ready) fini_result = rcl_subscription_fini(&zero_get_subscription, &node);
 #if MOTOR_BENCH_JOINT7_POSVEL
+    if (bench_profile_subscription_ready) fini_result = rcl_subscription_fini(&bench_profile_subscription, &node);
+    if (bench_profile_publisher_ready) fini_result = rcl_publisher_fini(&bench_profile_publisher, &node);
     if (bench_trace_publisher_ready) fini_result = rcl_publisher_fini(&bench_trace_publisher, &node);
     if (bench_snapshot_publisher_ready) fini_result = rcl_publisher_fini(&bench_snapshot_publisher, &node);
 #endif

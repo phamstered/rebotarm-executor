@@ -8,6 +8,9 @@
 
 #if MOTOR_BENCH_JOINT7_POSVEL
 #include "motor_bench_trace.h"
+#include "motor_bench_profile.h"
+bool motor_bridge_bench_profile_request(const MotorBenchProfileRequest *request, uint32_t now_ms);
+void motor_bridge_get_bench_profile_status(MotorBenchProfileStatus *status);
 typedef struct {
     MotorBenchDiagnostics admission;
     MotorBenchLoopDiagnostics loop;

@@ -564,7 +564,10 @@ marker and RID. No parameter writes or persistence commands are issued by this
 diagnostic. Any read failure, nonfinite or nonpositive ACC/MAX_SPD, nonfinite or
 nonnegative DEC, Deta outside the finite range [1, 30], unexpected feedback
 scaling (must be 12.5/30/10), or startup position outside the supplied window
-leaves support mask 0. Damp is the physical viscous coefficient, **not** the
+leaves support mask 0. The temporary-profile bench additionally requires the
+exact startup ACC/DEC baseline bits `0x40000000 / 0xc0000000` (2 / -2).
+An MCU reset does not power-cycle the drive: a leftover volatile profile must
+not become a newly accepted baseline. Damp is the physical viscous coefficient, **not** the
 speed-loop damping factor: its existing finite-positive check is retained as
 an additional conservative data check, and never substitutes for reading Deta.
 MAX_SPD describes the motor before the gearbox; it is not compared directly
@@ -590,8 +593,8 @@ The decoder rejects other lengths/magic and never accesses hardware.
 qualification. Record the actual version/parameter values with test evidence.
 
 During a joint7 V2 motion session only, the bench image also stops on actual
-feedback outside the configured position window plus 0.003 rad tolerance,
-absolute velocity above 0.10 rad/s, absolute reported effort above 0.30 N·m,
+feedback outside the configured position window without a tolerance expansion,
+absolute velocity above 0.05 rad/s, absolute reported effort above 0.30 N·m,
 nonfinite feedback, or feedback age over 100 ms (CAN RX timestamp). The control
 and safety paths use the existing lease revocation and all-axis DISABLE, clear
 POS support, and latch `trip_reason`, `trip_ms`, `trip_position`, `trip_velocity`
@@ -602,8 +605,9 @@ automatically resets the MCU or restarts motion. Investigate the cause before
 an explicit restart/reflash. This is a feedback-triggered stop; it cannot impose
 a drive-internal current/torque ceiling or guarantee zero transient overshoot.
 
-With this bench diagnostic, guard and queued STOP bookkeeping, local linked DTCMRAM use is 122504 bytes
-(Debug) / 122496 bytes (Release), about 93.46% of 128 KiB. This remains a static
+With the bench diagnostics, profile transaction, guard and queued STOP
+bookkeeping, local linked DTCMRAM use is 123704 bytes (Debug) / 123696 bytes
+(Release), about 94.38% of 128 KiB. This remains a static
 link measurement; task stack high-water marks and allocator headroom still need
 hardware measurement under the intended traffic.
 
@@ -628,9 +632,11 @@ receive a positive trial step; first move only toward the negative/open
 direction and do not automatically return into the closed stop. The example
 window is a transient bench envelope, not a replacement for that calibration.
 
-Suggested evidence sequence: fresh DISABLE; CONFIGURE joint7 and verify readback;
+Suggested evidence sequence: fresh DISABLE; apply the bounded volatile profile
+and verify its independent readbacks; CONFIGURE joint7 and verify mode readback;
 ACQUIRE; stream current-position TRACK at 20 Hz; a small reviewed opening step;
-HOLD; explicit DISABLE and physical disabled proof; restore MIT and RELEASE.
+HOLD; explicit DISABLE and physical disabled proof; restore MIT and RELEASE;
+restore the original acceleration and independently verify ACC and DEC.
 Monitor actual position, velocity, effort, feedback age, other-axis enabled bits
 and faults throughout; stop on any breach of the agreed test envelope. POS_VEL
 does not expose a commanded torque cap. Record HOLD/stop/recovery/watchdog and
@@ -649,6 +655,98 @@ factor and describes MAX_SPD before the gearbox. Its suggested damping range
 range. The bench readout independently checks Deta, without substituting Damp
 or MIT's application Kd. Verify the actual motor revision against the manual.
 
+
+### Bench volatile acceleration profile
+
+This interface exists only in the explicitly enabled joint7 bench image. It
+does not qualify a motor model or change the production support mask. The fixed
+profile 1 writes **only RID 4 ACC** on motor 7, using volatile CAN marker `0x55`:
+`2.0` (`0x40000000`) → `0.0002` (`0x3951b717`). RID 5 DEC must remain `-2.0`
+(`0xc0000000`) and is independently read before and after every transaction;
+it is never written. Keeping DEC preserves the existing deceleration setting.
+There is no arbitrary RID/value argument, `0xAA` save, zero-offset change, fault
+clear, motor enable, automatic retry with a new operation, or MCU reset.
+
+The motor task executes a nonblocking state machine. Fresh baseline reads
+precede the first write; a successful write acknowledgement alone is insufficient.
+After a 20 ms settling interval it independently reads both ACC and DEC. A
+missing write acknowledgement still requires independent readback. Failures
+after a potentially effective write initiate one bounded rollback. A failed
+rollback leaves `RESTORE_REQUIRED` and inhibits movement. The exact originals
+are retained for the entire boot and are never overwritten by a later request.
+Only one successfully prepared APPLY is allowed per boot. An explicit RESTORE
+can retry recovery, but cannot choose a different value.
+
+APPLY requires initialization, fresh verified all-axis DISABLE, no owner,
+lease, switch, fault or zero maintenance, and matching boot, control epoch,
+DISABLE sequence and profile generation. RESTORE retains all output-off gates
+but may run with a latched fault or retained owner: it only restores the saved
+same-boot ACC bits, without clearing the fault, changing owner/mode or enabling
+output. Busy or uncertain recovery blocks non-DISABLE commands, mode/lease
+mutations and zero maintenance. STOP remains available and cancels an in-flight
+APPLY; repeated STOP cannot restart an already-running recovery deadline.
+POS_VEL ACQUIRE and non-DISABLE V2 commands additionally require the profile's
+verified APPLIED state. Restoring parameters therefore closes this motion gate.
+
+Both Topics use `std_msgs/msg/UInt32MultiArray`, empty `layout.dim`, zero
+`layout.data_offset`, BEST_EFFORT and VOLATILE QoS:
+
+- `/stm32/joint7_bench_profile/request`: fixed 14 words; no message is sent by
+  default. Identical retries are idempotent, conflicting operation IDs rejected.
+- `/stm32/joint7_bench_profile/status`: fixed 32 words, at most 20 Hz, only after
+  verified all-axis output-off with no switch/lease. Status is suppressed during
+  motion and the stop-proof interval, just like the diagnostic Topics.
+
+Request words (all uint32, uint64 IDs split low then high):
+
+| Index | Meaning |
+| --- | --- |
+| 0–2 | magic `0x4a375131` (J7Q1), version 1, length 14 |
+| 3–6 | boot low/high, source low/high |
+| 7–9 | nonzero increasing operation ID, action APPLY=1 / RESTORE=2, profile=1 |
+| 10–12 | expected control epoch, latest DISABLE sequence, expected profile generation |
+| 13 | valid-until MCU tick, 1–1000 ms in the future at admission; wrap-aware |
+
+Status words:
+
+| Index | Meaning |
+| --- | --- |
+| 0–5 | magic `0x4a375031` (J7P1), version 1, length 32, boot low/high, MCU tick |
+| 6–9 | phase, result, error, profile generation |
+| 10–14 | source low/high, operation ID, action, profile ID |
+| 15–17 | busy, possibly modified (`dirty`), original values recorded |
+| 18–21 | original ACC/DEC bits, latest independently read ACC/DEC bits |
+| 22–24 | latest read mask (ACC bit 0, DEC bit 1), applied verified, restore verified |
+| 25–27 | operation start, phase start, completion MCU ticks |
+| 28–31 | last rejected operation/error, cumulative write attempts, rollback attempts |
+
+Results are IDLE=0, PENDING=1, APPLIED=2, RESTORED=3, ROLLED_BACK=4,
+FAILED=5, RESTORE_REQUIRED=6. Errors are OK=0, INVALID=1, IDENTITY=2,
+STALE=3, BUSY=4, UNSAFE=5, BASELINE=6, CAN=7, TIMEOUT=8, READBACK=9,
+NO_ORIGINAL=10, CANCELLED=11. Phases 0–11 are IDLE, READ_ACC, WAIT_ACC,
+READ_DEC, WAIT_DEC, WRITE_ACC, WAIT_WRITE, SETTLE, VERIFY_ACC,
+WAIT_VERIFY_ACC, VERIFY_DEC, WAIT_VERIFY_DEC. Each CAN phase has a 100 ms
+deadline; the operation is bounded to 1200 ms and rollback to 600 ms, including
+FIFO backpressure or waiting for output-off proof. Replies must match feedback
+CAN ID `0x17`, motor 7, marker, RID, phase and a nonfuture receive timestamp
+at or after the phase's send time.
+
+Run `python3 scripts/joint7_bench_profile.py --boot <reviewed-boot-id>` in the
+ROS overlay for read-only observation (no publisher). Explicit `--action apply`
+or `--action restore` sends only the fixed profile request; neither sends a
+motion command. Redirect JSONL stdout to a new evidence file **before APPLY**:
+the helper flushes baseline/identity evidence before publishing and verifies
+terminal independent readbacks. It also checks that each profile endpoint is
+the single expected MCU node. Its three identical request transmissions are
+one operation, not new automatic attempts. An uncertain result requires output
+to remain off until current state and recovery evidence are reviewed.
+
+**A drive may retain volatile ACC across MCU restart or reflash.** Persist the
+original bits and drive/MCU identity before APPLY. New startup admission rejects
+nonbaseline ACC/DEC and never writes them back automatically. Same-boot RESTORE
+records cannot survive MCU reset, and an old-boot request is rejected. Never
+use a restart as evidence of restored parameters. Neither parameter readback
+nor a sampled speed guard guarantees continuous physical speed or arrival.
 
 ### Bench diagnostics over ROS
 
@@ -679,8 +777,10 @@ read result; the separate read mask and completion flag distinguish a successful
 zero from a missing value. Each read has the same 100 ms bound; these extra reads
 can add up to 0.9 s. They run only when startup feedback reports all drives
 DISABLED. Their success or numerical value does **not** change the original
-admission criteria or establish dynamic qualification. No register write or
-save operation is added. The original 148-byte J7B3 SWD layout is unchanged.
+admission criteria or establish dynamic qualification. These diagnostic Topics
+issue no register write or save operation. The separate explicit profile
+transaction below is the only added acceleration writer.
+The original 148-byte J7B3 SWD layout is unchanged.
 
 Interpret parameters against the actual drive revision. The cited DM-J4310-2EC
 V1.1 manual V1.3, page 26, describes ACC/DEC as rotor-side **Krad/s²** in non-MIT
@@ -695,7 +795,8 @@ change Gr or assume that register validity qualifies low-speed POS_VEL.
 The 512-record ring occupies 8192 explicitly initialized NOLOAD bytes in RAM_D1,
 not DTCMRAM or the RTOS heap. Local production Debug/Release still link at
 122352/122344 DTCMRAM bytes with no trace allocation. The diagnostic bench
-Debug/Release images use 123288/123272 DTCMRAM bytes (94.06%/94.05%), 8192 RAM_D1
+Debug/Release images, including the profile transaction, use 123704/123696
+DTCMRAM bytes (94.38%/94.37%), 8192 RAM_D1
 bytes, and 26720 RAM_D2 bytes. These link sizes include static reservations;
 read the runtime counters as well before drawing conclusions about headroom.
 Records contain MCU milliseconds, a tag and the

@@ -28,6 +28,7 @@ int main(void)
     assert(sizeof(d) == 148 && d.magic == 0x4a374233);
     assert(d.complete && d.read_mask == 0xfff && d.admitted_mask == 0x40 && calls == 12);
     assert(d.raw[0] == 0 && d.raw[1] == 0x38313037 && d.raw[2] == 0);
+    assert(d.raw[5] == 0x40000000U && d.raw[6] == 0xc0000000U);
     assert(motor_bench_float(d.raw[4]) == damp && motor_bench_float(d.raw[6]) == -2.0f);
     assert(motor_bench_float(d.raw[11]) == 4.0f);
     calls = 0;
@@ -48,6 +49,34 @@ int main(void)
         assert(d.admitted_mask == 0);
     }
     dec = -2.0f;
+    /* An MCU reset does not reset the drive's volatile ACC. Recollecting the
+     * temporary ACC-only profile must preserve the evidence and deny admission. */
+    acc = 0.0002f;
+    assert(!motor_bench_collect(&d, true, 0.50f, read_register, NULL));
+    assert(d.complete && d.read_mask == 0xfffU && d.admitted_mask == 0U);
+    assert(motor_bench_float(d.raw[5]) == acc && d.raw[6] == 0xc0000000U);
+    acc = 2.0f;
+    assert(motor_bench_collect(&d, true, 0.50f, read_register, NULL));
+    /* Positive ACC and negative DEC alone are insufficient: even one ULP from
+     * either baseline value must fail, not pass an approximate comparison. */
+    const uint32_t nonbaseline_acc[] = {0x3fffffffU, 0x40000001U};
+    const uint32_t nonbaseline_dec[] = {0xbfffffffU, 0xc0000001U};
+    for (unsigned i = 0U; i < 2U; ++i) {
+        acc = motor_bench_float(nonbaseline_acc[i]);
+        assert(!motor_bench_collect(&d, true, 0.50f, read_register, NULL));
+        assert(d.raw[5] == nonbaseline_acc[i] && d.admitted_mask == 0U);
+        acc = 2.0f;
+        dec = motor_bench_float(nonbaseline_dec[i]);
+        assert(!motor_bench_collect(&d, true, 0.50f, read_register, NULL));
+        assert(d.raw[6] == nonbaseline_dec[i] && d.admitted_mask == 0U);
+        dec = -2.0f;
+    }
+    assert(motor_bench_collect(&d, true, MOTOR_BENCH_POSITION_MIN, read_register, NULL));
+    assert(motor_bench_collect(&d, true, MOTOR_BENCH_POSITION_MAX, read_register, NULL));
+    assert(!motor_bench_collect(&d, true, MOTOR_BENCH_POSITION_MIN - 0.000001f,
+                               read_register, NULL));
+    assert(!motor_bench_collect(&d, true, MOTOR_BENCH_POSITION_MAX + 0.000001f,
+                               read_register, NULL));
     const float invalid_deta[] = {0.0f, -4.0f, 0.999f, 30.001f, NAN, INFINITY, -INFINITY};
     for (unsigned i = 0; i < sizeof(invalid_deta) / sizeof(*invalid_deta); ++i) {
         deta = invalid_deta[i];
@@ -71,16 +100,24 @@ int main(void)
     assert(motor_bench_collect(&d, true, 0.50f, read_register, NULL));
     max_spd = 600.0f;
     vmax = 50; assert(!motor_bench_collect(&d, true, 0.50f, read_register, NULL));
-    assert(!motor_bench_feedback_reason(true, 100, 0.5f, 0.10f, 0.30f));
-    assert(!motor_bench_feedback_reason(true, 100, 0.5f, -0.10f, -0.30f));
+    assert(!motor_bench_feedback_reason(true, 100, 0.5f, 0.05f, 0.30f));
+    assert(!motor_bench_feedback_reason(true, 100, 0.5f, -0.05f, -0.30f));
     assert(motor_bench_feedback_reason(true, 101, 0.5f, 0, 0) == 1);
     assert(motor_bench_feedback_reason(false, 0, 0.5f, 0, 0) == 1);
     assert(motor_bench_feedback_reason(true, 0, NAN, 0, 0) == 2);
-    assert(!motor_bench_feedback_reason(true, 0, MOTOR_BENCH_POSITION_MIN - 0.003f, 0, 0));
-    assert(!motor_bench_feedback_reason(true, 0, MOTOR_BENCH_POSITION_MAX + 0.003f, 0, 0));
-    assert(motor_bench_feedback_reason(true, 0, MOTOR_BENCH_POSITION_MIN - 0.0031f, 0, 0) == 3);
-    assert(motor_bench_feedback_reason(true, 0, MOTOR_BENCH_POSITION_MAX + 0.0031f, 0, 0) == 3);
-    assert(motor_bench_feedback_reason(true, 0, 0.5f, -0.101f, 0) == 4);
+    assert(motor_bench_feedback_reason(true, 0, 0.5f, INFINITY, 0) == 2);
+    assert(motor_bench_feedback_reason(true, 0, 0.5f, -INFINITY, 0) == 2);
+    assert(motor_bench_feedback_reason(true, 0, 0.5f, 0, NAN) == 2);
+    assert(!motor_bench_feedback_reason(true, 0, MOTOR_BENCH_POSITION_MIN, 0, 0));
+    assert(!motor_bench_feedback_reason(true, 0, MOTOR_BENCH_POSITION_MAX, 0, 0));
+    assert(motor_bench_feedback_reason(true, 0, MOTOR_BENCH_POSITION_MIN - 0.000001f, 0, 0) == 3);
+    assert(motor_bench_feedback_reason(true, 0, MOTOR_BENCH_POSITION_MAX + 0.000001f, 0, 0) == 3);
+    const float above_velocity_limit = motor_bench_float(0x3d4cccceU); /* One ULP above 0.05f. */
+    assert(above_velocity_limit > 0.05f);
+    assert(motor_bench_feedback_reason(true, 0, 0.5f, above_velocity_limit, 0) == 4);
+    assert(motor_bench_feedback_reason(true, 0, 0.5f, -above_velocity_limit, 0) == 4);
+    assert(motor_bench_feedback_reason(true, 0, 0.5f, 0.075f, 0) == 4);
+    assert(motor_bench_feedback_reason(true, 0, 0.5f, -0.075f, 0) == 4);
     assert(motor_bench_feedback_reason(true, 0, 0.5f, 0, -0.301f) == 5);
     MotorBenchLoopDiagnostics loop;
     calls = 0;

@@ -112,6 +112,7 @@ static MotorBenchTraceRecord motor_bench_trace_records[MOTOR_BENCH_TRACE_CAPACIT
 #endif
     ;
 static MotorBenchTraceMeta motor_bench_trace_meta;
+static MotorBenchProfile motor_bench_profile;
 
 static void bench_trace_can(uint32_t kind, uint16_t can_id,
                             const uint8_t *data, uint32_t received_ms)
@@ -238,6 +239,37 @@ static bool disabled_proven(uint32_t now)
     }
     return true;
 }
+
+#if MOTOR_BENCH_JOINT7_POSVEL
+static MotorBenchProfileEnvironment bench_profile_environment(uint32_t now)
+{
+    return (MotorBenchProfileEnvironment){
+        .boot_id = state.control.boot_id, .control_epoch = state.control.control_epoch,
+        .disable_sequence = state.snapshot.last_command_sequence,
+        .initialized = state.initialized, .disabled_verified = disabled_proven(now),
+        .owner_free = state.control.owner_source_id == 0U,
+        .lease_free = state.control.lease_id == 0U, .not_switching = !state.control.switching,
+        .fault_free = state.snapshot.fault_code == MOTOR_FAULT_NONE &&
+            !state.communication_loss_latched && !bench_latched_fault(),
+        .zero_idle = !state.zero_snapshot.busy
+    };
+}
+
+static int bench_profile_send(uint8_t rid, bool write, uint32_t value, void *context)
+{
+    (void)context;
+    /* Independent allowlist: state-machine mistakes must never become arbitrary
+     * writes, DEC changes, persistence, or motion commands. */
+    if ((rid != 4U && rid != 5U) || (write && (rid != 4U ||
+        (value != MOTOR_BENCH_PROFILE_ACC_TARGET && value != MOTOR_BENCH_PROFILE_ACC_ORIGINAL))))
+        return -1;
+    if (fdcan1_tx_free() == 0U) return 1;
+    uint8_t data[DAMIAO_DLC];
+    if (write) damiao_encode_register_write_cmd(7U, 4U, value, data);
+    else damiao_encode_register_read_cmd(7U, rid, data);
+    return send_frame(damiao_get_register_can_id(), data) ? 0 : -1;
+}
+#endif
 
 static uint64_t boot_nonce(void)
 {
@@ -549,6 +581,9 @@ void motor_bridge_init(void)
     motor_bench_trace_init(&motor_bench_trace_meta, motor_bench_trace_records);
 #endif
     motor_v2_init(&state.control, boot_nonce());
+#if MOTOR_BENCH_JOINT7_POSVEL
+    motor_bench_profile_init(&motor_bench_profile, state.control.boot_id);
+#endif
     /* POS capabilities stay zero until each model/firmware is bench-qualified. */
     for (uint32_t i = 0; i < MOTOR_BRIDGE_JOINT_COUNT; ++i) {
         const MotorQualifiedCapability *cap = &motor_qualified_capabilities[i];
@@ -610,6 +645,13 @@ bool motor_bridge_accept_command(const MotorBridgeCommand *command, uint32_t now
 {
     taskENTER_CRITICAL();
     bool disable = command->mode == MOTOR_MODE_DISABLE;
+#if MOTOR_BENCH_JOINT7_POSVEL
+    if (!disable && motor_bench_profile_inhibits(&motor_bench_profile)) {
+        state.control.rejected_sequence = command->sequence;
+        state.control.reject_code = MV2_BUSY;
+        taskEXIT_CRITICAL(); return false;
+    }
+#endif
     uint16_t fault = disable ? MOTOR_FAULT_NONE : validate_command(command);
     if (!state.initialized && !disable) fault = MOTOR_FAULT_INIT;
     else if (!disable && !motor_v2_mit_allowed(&state.control)) fault = MOTOR_FAULT_CONTROL_MODE;
@@ -631,6 +673,9 @@ bool motor_bridge_accept_command(const MotorBridgeCommand *command, uint32_t now
     }
     state.command = *command;
     if (disable) {
+#if MOTOR_BENCH_JOINT7_POSVEL
+        motor_bench_profile_cancel(&motor_bench_profile, now_ms);
+#endif
         memset(&state.command, 0, sizeof(state.command));
         state.command.sequence = command->sequence;
         state.command.mode = MOTOR_MODE_DISABLE;
@@ -654,6 +699,10 @@ bool motor_bridge_accept_command_v2(const MotorCommandV2 *command, uint32_t now_
     if (bench_latched_fault()) fault = bench_latched_fault();
     if (!state.initialized || state.zero_snapshot.busy) fault = MOTOR_FAULT_INIT;
     uint16_t error = MV2_OK;
+#if MOTOR_BENCH_JOINT7_POSVEL
+    if (motor_bench_profile_inhibits(&motor_bench_profile)) error = MV2_BUSY;
+    else if (!motor_bench_profile_ready(&motor_bench_profile)) error = MV2_UNSUPPORTED;
+#endif
     if (command->mode == MOTOR_MODE_HOLD) {
         for (uint32_t i = 0; i < MOTOR_BRIDGE_JOINT_COUNT; ++i) {
             if (!(command->active_joint_mask & (1U << i))) continue;
@@ -694,12 +743,26 @@ bool motor_bridge_accept_command_v2(const MotorCommandV2 *command, uint32_t now_
 MotorControlResponse motor_bridge_control_request(const MotorControlRequest *request, uint32_t now_ms)
 {
     taskENTER_CRITICAL();
+#if MOTOR_BENCH_JOINT7_POSVEL
+    uint16_t profile_error = MV2_OK;
+    if (request->action != 4U && motor_bench_profile_inhibits(&motor_bench_profile)) profile_error = MV2_BUSY;
+    else if (request->action == 2U && request->control_mode == 2U &&
+             !motor_bench_profile_ready(&motor_bench_profile)) profile_error = MV2_UNSUPPORTED;
+    if (profile_error) {
+        MotorControlResponse denied = {false, profile_error, state.control.control_epoch,
+            state.control.lease_id, request->operation_id};
+        taskEXIT_CRITICAL(); return denied;
+    }
+#endif
     uint16_t fault = state.communication_loss_latched ? MOTOR_FAULT_COMMAND_LOSS_LATCHED : state.snapshot.fault_code;
     if (bench_latched_fault()) fault = bench_latched_fault();
     if (!state.initialized || state.zero_snapshot.busy) fault = MOTOR_FAULT_INIT;
     MotorControlResponse response = motor_v2_request(&state.control, request,
         disabled_proven(now_ms), fault, state.snapshot.last_command_sequence, now_ms);
     if (response.accepted && request->action == 4U) {
+#if MOTOR_BENCH_JOINT7_POSVEL
+        motor_bench_profile_cancel(&motor_bench_profile, now_ms);
+#endif
         request_disable();
         set_mode(MOTOR_MODE_DISABLE);
     }
@@ -732,6 +795,10 @@ static void consume_feedback(uint32_t now_ms)
         for (uint32_t i = 0U; i < MOTOR_BRIDGE_JOINT_COUNT; i++) {
             if (can_id == feedback_ids[i]) {
                 if (damiao_is_register_reply(data) || damiao_is_register_write_ack(data)) {
+#if MOTOR_BENCH_JOINT7_POSVEL
+                    if (i == 6U)
+                        motor_bench_profile_reply(&motor_bench_profile, can_id, data, received_ms, now_ms);
+#endif
                     if (data[0] == motor_ids[i] && data[1] == 0U && data[3] == DAMIAO_REG_CTRL_MODE) {
                         uint32_t value; memcpy(&value, data + 4, sizeof(value));
                         motor_v2_register_reply(&state.control, (uint8_t)i,
@@ -800,6 +867,7 @@ static void control_step_locked(uint32_t now_ms)
     uint8_t data[DAMIAO_DLC];
 #if MOTOR_BENCH_JOINT7_POSVEL
     motor_bench_trace_tick(&motor_bench_trace_meta, now_ms);
+    (void)motor_bench_profile_deadline(&motor_bench_profile, now_ms);
 #endif
     if (state.disable_pending) (void)send_disable();
     /* Wait for actual CAN transmission before requesting post-stop feedback.
@@ -816,6 +884,11 @@ static void control_step_locked(uint32_t now_ms)
     consume_feedback(now_ms);
 #if MOTOR_BENCH_JOINT7_POSVEL
     if (enforce_joint7_bench_feedback(now_ms, bench_was_active)) return;
+    if ((state.disable_pending || state.disable_tx_wait) && motor_bench_profile.status.busy) {
+        MotorBenchProfileEnvironment environment = bench_profile_environment(now_ms);
+        motor_bench_profile_step(&motor_bench_profile, &environment, now_ms,
+                                  bench_profile_send, NULL);
+    }
 #endif
     if (state.disable_pending || state.disable_tx_wait) return;
     motor_v2_step(&state.control, disabled_proven(now_ms), now_ms, runtime_register_send, NULL);
@@ -835,6 +908,18 @@ static void control_step_locked(uint32_t now_ms)
             state.last_feedback_request_ms[i] = now_ms;
         }
     }
+
+#if MOTOR_BENCH_JOINT7_POSVEL
+    if (motor_bench_profile.status.busy) {
+        MotorBenchProfileEnvironment environment = bench_profile_environment(now_ms);
+        motor_bench_profile_step(&motor_bench_profile, &environment, now_ms,
+                                  bench_profile_send, NULL);
+        /* Outputs were off at admission; any unexpected enabled feedback keeps
+         * the existing whole-arm STOP queue above this maintenance operation. */
+        if (any_motor_enabled()) { request_disable(); (void)send_disable(); }
+        return;
+    }
+#endif
 
     if (state.snapshot.mode == MOTOR_MODE_DISABLE || !state.have_command) {
         if (any_motor_enabled()) {
@@ -1022,6 +1107,11 @@ bool motor_bridge_request_zero_position(uint8_t operation, uint32_t joint_mask)
 {
     joint_mask &= MOTOR_BRIDGE_ACTIVE_JOINT_MASK;
     taskENTER_CRITICAL();
+#if MOTOR_BENCH_JOINT7_POSVEL
+    if (motor_bench_profile_inhibits(&motor_bench_profile)) {
+        taskEXIT_CRITICAL(); return false;
+    }
+#endif
     if (!motor_v2_mit_allowed(&state.control) || state.zero_pending_operation != MOTOR_ZERO_OPERATION_NONE ||
         state.zero_snapshot.busy) {
         taskEXIT_CRITICAL();
@@ -1063,6 +1153,22 @@ void motor_bridge_get_zero_snapshot(MotorBridgeZeroSnapshot *snapshot)
 }
 
 #if MOTOR_BENCH_JOINT7_POSVEL
+bool motor_bridge_bench_profile_request(const MotorBenchProfileRequest *request, uint32_t now_ms)
+{
+    taskENTER_CRITICAL();
+    MotorBenchProfileEnvironment environment = bench_profile_environment(now_ms);
+    bool accepted = motor_bench_profile_request(&motor_bench_profile, request, &environment, now_ms);
+    taskEXIT_CRITICAL();
+    return accepted;
+}
+
+void motor_bridge_get_bench_profile_status(MotorBenchProfileStatus *status)
+{
+    taskENTER_CRITICAL();
+    *status = motor_bench_profile.status;
+    taskEXIT_CRITICAL();
+}
+
 void motor_bridge_get_bench_snapshot(MotorBenchSnapshot *snapshot)
 {
     taskENTER_CRITICAL();
@@ -1086,6 +1192,9 @@ uint32_t motor_bridge_copy_bench_trace(uint32_t start_sequence,
 void motor_bridge_force_disable(uint16_t fault_code)
 {
     taskENTER_CRITICAL();
+#if MOTOR_BENCH_JOINT7_POSVEL
+    motor_bench_profile_cancel(&motor_bench_profile, HAL_GetTick());
+#endif
     state.snapshot.fault_code = fault_code;
     request_disable();
     set_mode(MOTOR_MODE_DISABLE);

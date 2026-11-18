@@ -57,15 +57,16 @@ static inline void motor_bench_collect_loop(MotorBenchLoopDiagnostics *d,
     d->complete = 1U;
 }
 
-/* Feedback stop thresholds, not a drive-internal current/torque limiter. */
+/* Feedback stop thresholds, not a drive-internal current/torque limiter.
+ * The configured position interval has no extra overshoot allowance. */
 static inline uint32_t motor_bench_feedback_reason(bool valid, uint32_t age_ms,
     float position, float velocity, float effort)
 {
     if (!valid || age_ms > 100U) return 1U;
     if (!isfinite(position) || !isfinite(velocity) || !isfinite(effort)) return 2U;
-    if (position < MOTOR_BENCH_POSITION_MIN - 0.003f ||
-        position > MOTOR_BENCH_POSITION_MAX + 0.003f) return 3U;
-    if (fabsf(velocity) > 0.10f) return 4U;
+    if (position < MOTOR_BENCH_POSITION_MIN ||
+        position > MOTOR_BENCH_POSITION_MAX) return 3U;
+    if (fabsf(velocity) > 0.05f) return 4U;
     if (fabsf(effort) > 0.30f) return 5U;
     return 0U;
 }
@@ -103,6 +104,10 @@ static inline bool motor_bench_collect(MotorBenchDiagnostics *d, bool disabled,
         /* DEC is signed deceleration, unlike positive ACC/Damp/MAX_SPD. */
         valid = valid && isfinite(value) && (i == 6 ? value < 0.0f : value > 0.0f);
     }
+    /* Startup must observe the exact baseline ACC=2 / DEC=-2 float bits.
+     * A drive's temporary RAM profile can survive an MCU-only reset. Do not
+     * silently admit it as a fresh baseline or overwrite it during collection. */
+    valid = valid && d->raw[5] == 0x40000000U && d->raw[6] == 0xc0000000U;
     /* MAX_SPD is a pre-gearbox motor parameter, not the output-shaft command cap. */
     float damping_factor = motor_bench_float(d->raw[11]);
     valid = valid && isfinite(damping_factor) &&
