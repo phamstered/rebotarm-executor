@@ -97,7 +97,7 @@ static inline uint32_t motor_bench_feedback_reason(bool valid, uint32_t age_ms,
     if (!isfinite(position) || !isfinite(velocity) || !isfinite(effort)) return 2U;
     if (position < MOTOR_BENCH_POSITION_MIN ||
         position > MOTOR_BENCH_POSITION_MAX) return 3U;
-    if (fabsf(velocity) > 0.05f) return 4U;
+    if (fabsf(velocity) > 0.1f) return 4U;
     if (fabsf(effort) > 0.30f) return 5U;
     return 0U;
 }

@@ -113,8 +113,8 @@ int main(void)
     assert(motor_bench_collect(&d, true, 0.50f, read_register, NULL));
     max_spd = 600.0f;
     vmax = 50; assert(!motor_bench_collect(&d, true, 0.50f, read_register, NULL));
-    assert(!motor_bench_feedback_reason(true, 100, 0.5f, 0.05f, 0.30f));
-    assert(!motor_bench_feedback_reason(true, 100, 0.5f, -0.05f, -0.30f));
+    assert(!motor_bench_feedback_reason(true, 100, 0.5f, 0.1f, 0.30f));
+    assert(!motor_bench_feedback_reason(true, 100, 0.5f, -0.1f, -0.30f));
     assert(motor_bench_feedback_reason(true, 101, 0.5f, 0, 0) == 1);
     assert(motor_bench_feedback_reason(false, 0, 0.5f, 0, 0) == 1);
     assert(motor_bench_feedback_reason(true, 0, NAN, 0, 0) == 2);
@@ -125,12 +125,12 @@ int main(void)
     assert(!motor_bench_feedback_reason(true, 0, MOTOR_BENCH_POSITION_MAX, 0, 0));
     assert(motor_bench_feedback_reason(true, 0, MOTOR_BENCH_POSITION_MIN - 0.000001f, 0, 0) == 3);
     assert(motor_bench_feedback_reason(true, 0, MOTOR_BENCH_POSITION_MAX + 0.000001f, 0, 0) == 3);
-    const float above_velocity_limit = motor_bench_float(0x3d4cccceU); /* One ULP above 0.05f. */
-    assert(above_velocity_limit > 0.05f);
+    const float above_velocity_limit = motor_bench_float(0x3dccccceU); /* One ULP above 0.1f. */
+    assert(above_velocity_limit > 0.1f);
     assert(motor_bench_feedback_reason(true, 0, 0.5f, above_velocity_limit, 0) == 4);
     assert(motor_bench_feedback_reason(true, 0, 0.5f, -above_velocity_limit, 0) == 4);
-    assert(motor_bench_feedback_reason(true, 0, 0.5f, 0.075f, 0) == 4);
-    assert(motor_bench_feedback_reason(true, 0, 0.5f, -0.075f, 0) == 4);
+    assert(!motor_bench_feedback_reason(true, 0, 0.5f, 0.075f, 0));
+    assert(!motor_bench_feedback_reason(true, 0, 0.5f, -0.075f, 0));
     assert(motor_bench_feedback_reason(true, 0, 0.5f, 0, -0.301f) == 5);
     MotorBenchLoopDiagnostics loop;
     calls = 0;
