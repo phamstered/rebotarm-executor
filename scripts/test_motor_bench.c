@@ -125,12 +125,17 @@ int main(void)
     assert(!motor_bench_feedback_reason(true, 0, MOTOR_BENCH_POSITION_MAX, 0, 0));
     assert(motor_bench_feedback_reason(true, 0, MOTOR_BENCH_POSITION_MIN - 0.000001f, 0, 0) == 3);
     assert(motor_bench_feedback_reason(true, 0, MOTOR_BENCH_POSITION_MAX + 0.000001f, 0, 0) == 3);
+#if MOTOR_BENCH_OVERSPEED_STOP
     const float above_velocity_limit = motor_bench_float(0x3dccccceU); /* One ULP above 0.1f. */
     assert(above_velocity_limit > 0.1f);
     assert(motor_bench_feedback_reason(true, 0, 0.5f, above_velocity_limit, 0) == 4);
     assert(motor_bench_feedback_reason(true, 0, 0.5f, -above_velocity_limit, 0) == 4);
     assert(!motor_bench_feedback_reason(true, 0, 0.5f, 0.075f, 0));
     assert(!motor_bench_feedback_reason(true, 0, 0.5f, -0.075f, 0));
+#else
+    assert(!motor_bench_feedback_reason(true, 0, 0.5f, 0.15f, 0));
+    assert(!motor_bench_feedback_reason(true, 0, 0.5f, -0.15f, 0));
+#endif
     assert(motor_bench_feedback_reason(true, 0, 0.5f, 0, -0.301f) == 5);
     MotorBenchLoopDiagnostics loop;
     calls = 0;

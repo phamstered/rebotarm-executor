@@ -623,6 +623,16 @@ explicit DISABLE remains available and does not erase the diagnostic. Nothing
 automatically resets the MCU or restarts motion. Investigate the cause before
 an explicit restart/reflash. This is a feedback-triggered stop; it cannot impose
 a drive-internal current/torque ceiling or guarantee zero transient overshoot.
+`MOTOR_BENCH_OVERSPEED_STOP` defaults to `ON`. An explicitly supervised
+joint7 bench build may set it to `OFF` (flash script: `--disable-overspeed-stop`
+with `--bench-joint7`). This suppresses only speed trip reason 4: speed remains
+measured and captured; nonfinite feedback, position, effort, freshness, lease
+and DISABLE protections remain active. Production builds reject this opt-out.
+The flash script explicitly restores `ON` when the flag is absent, so a prior
+supervised build does not silently carry the opt-out into the next invocation.
+The option does not change command speed or qualify POS_VEL operation; record
+the build flag in the test receipt. Existing snapshot fields do not expose it.
+
 The 0.1 rad/s feedback stop threshold is separate from the command speed cap
 (`MOTOR_BENCH_VELOCITY_MAX`, still at most 0.05 rad/s); it does not increase
 the requested speed. The half-opening diagnostic trial uses 0.005 rad/s.
