@@ -10,6 +10,7 @@ BUILD_DIR="$PROJECT_DIR/build/Debug"
 USE_OPENOCD=false
 BUILD_ONLY=false
 BENCH=false
+OVERSPEED_STOP=ON
 SERIAL=""
 POSITION_MIN=""
 POSITION_MAX=""
@@ -21,6 +22,7 @@ while (($#)); do
         --build) : ;; # Historical alias: every invocation already rebuilds.
         --build-only) BUILD_ONLY=true ;;
         --bench-joint7) BENCH=true ;;
+        --disable-overspeed-stop) OVERSPEED_STOP=OFF ;;
         --serial|--position-min|--position-max|--velocity-max)
             if (($# < 2)); then echo "Missing value for $1" >&2; exit 2; fi
             case "$1" in
@@ -33,6 +35,7 @@ while (($#)); do
         --help|-h)
             echo "Usage: $0 [--openocd] [--serial SERIAL] [--build-only]"
             echo "Bench: --bench-joint7 --position-min RAD --position-max RAD --velocity-max RAD_S"
+            echo "Supervised bench only: --disable-overspeed-stop (speed logging remains; other guards remain)"
             echo "Bench flash requires --serial; bounds are mandatory finite decimals."
             exit 0
             ;;
@@ -41,7 +44,10 @@ while (($#)); do
     shift
 done
 
-CONFIGURE_ARGS=(--preset Debug -DMOTOR_BENCH_JOINT7_POSVEL=OFF)
+if [[ "$OVERSPEED_STOP" == OFF ]] && ! "$BENCH"; then
+    echo "--disable-overspeed-stop requires --bench-joint7" >&2; exit 2
+fi
+CONFIGURE_ARGS=(--preset Debug -DMOTOR_BENCH_JOINT7_POSVEL=OFF -DMOTOR_BENCH_OVERSPEED_STOP=ON)
 if "$BENCH"; then
     if [[ -z "$POSITION_MIN" || -z "$POSITION_MAX" || -z "$VELOCITY_MAX" ]]; then
         echo "Bench requires explicit --position-min, --position-max and --velocity-max" >&2; exit 2
@@ -52,7 +58,8 @@ if "$BENCH"; then
     BUILD_DIR="$PROJECT_DIR/build/BenchJoint7Debug"
     CONFIGURE_ARGS=(--preset Debug -B "$BUILD_DIR" -DMOTOR_BENCH_JOINT7_POSVEL=ON
         "-DMOTOR_BENCH_POSITION_MIN=$POSITION_MIN" "-DMOTOR_BENCH_POSITION_MAX=$POSITION_MAX"
-        "-DMOTOR_BENCH_VELOCITY_MAX=$VELOCITY_MAX")
+        "-DMOTOR_BENCH_VELOCITY_MAX=$VELOCITY_MAX"
+        "-DMOTOR_BENCH_OVERSPEED_STOP=$OVERSPEED_STOP")
 elif [[ -n "$POSITION_MIN$POSITION_MAX$VELOCITY_MAX" ]]; then
     echo "Bounds require --bench-joint7" >&2; exit 2
 fi

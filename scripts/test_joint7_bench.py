@@ -55,6 +55,8 @@ class BenchBuildTest(unittest.TestCase):
                 f'include("{ROOT}/cmake/joint7-bench.cmake")\n')
             cases = [
                 ({}, 'normal', True),
+                ({'MOTOR_BENCH_JOINT7_POSVEL': 'OFF', 'MOTOR_BENCH_OVERSPEED_STOP': 'OFF'}, 'production_optout', False),
+                ({'MOTOR_BENCH_OVERSPEED_STOP': 'OFF'}, 'supervised', True),
                 ({'MOTOR_BENCH_JOINT7_POSVEL': 'ON'}, 'missing', False),
                 ({'MOTOR_BENCH_POSITION_MIN': 'nan'}, 'nan', False),
                 ({'MOTOR_BENCH_POSITION_MAX': '0.4'}, 'inverted', False),
@@ -77,6 +79,20 @@ class BenchBuildTest(unittest.TestCase):
                 result = subprocess.run(command, capture_output=True, text=True)
                 self.assertEqual(result.returncode == 0, expected,
                                  (directory, result.stdout, result.stderr))
+
+    def test_feedback_guard_default_and_supervised(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            for mode in (None, '0'):
+                output = str(Path(temporary) / ('guard-' + str(mode)))
+                command = ['cc', '-std=c11', '-Wall', '-Wextra', '-Werror',
+                    '-I' + str(ROOT / 'User'), '-DMOTOR_BENCH_JOINT7_POSVEL=1',
+                    '-DMOTOR_BENCH_POSITION_MIN=0.48f', '-DMOTOR_BENCH_POSITION_MAX=0.51f',
+                    '-DMOTOR_BENCH_VELOCITY_MAX=0.05f']
+                if mode is not None:
+                    command.append('-DMOTOR_BENCH_OVERSPEED_STOP=' + mode)
+                command += [str(ROOT / 'scripts/test_motor_bench.c'), '-o', output]
+                subprocess.run(command, check=True, capture_output=True)
+                subprocess.run([output], check=True, capture_output=True)
 
     def test_flash_script_routing(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -109,6 +125,12 @@ class BenchBuildTest(unittest.TestCase):
             for parameter in ['POSITION_MIN=0.48', 'POSITION_MAX=0.51', 'VELOCITY_MAX=0.05']:
                 self.assertIn(parameter, text)
             self.assertNotIn('st-flash', text)
+            self.assertIn('-DMOTOR_BENCH_OVERSPEED_STOP=ON', text)
+            log.write_text('')
+            self.assertNotEqual(run('--disable-overspeed-stop', '--build-only').returncode, 0)
+            self.assertEqual(log.read_text(), '')
+            self.assertEqual(run(*bounds, '--disable-overspeed-stop', '--build-only').returncode, 0)
+            self.assertIn('-DMOTOR_BENCH_OVERSPEED_STOP=OFF', log.read_text())
             log.write_text('')
             self.assertEqual(run(*bounds, '--serial', 'ABC123').returncode, 0)
             self.assertIn('st-flash --serial ABC123 --reset write', log.read_text())
@@ -118,6 +140,7 @@ class BenchBuildTest(unittest.TestCase):
             log.write_text('')
             self.assertEqual(run('--build-only').returncode, 0)
             self.assertIn('-DMOTOR_BENCH_JOINT7_POSVEL=OFF', log.read_text())
+            self.assertIn('-DMOTOR_BENCH_OVERSPEED_STOP=ON', log.read_text())
             self.assertNotIn('BenchJoint7Debug', log.read_text())
             self.assertEqual(run().returncode, 0)
             self.assertIn('st-flash --reset write', log.read_text())
