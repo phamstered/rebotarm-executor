@@ -18,13 +18,16 @@ from decode_joint7_bench import decode_dump
 SNAPSHOT_MAGIC = 0x4A375331
 TRACE_MAGIC = 0x4A375431
 CALIBRATION_MAGIC = 0x4A374331
+STARTUP_MAGIC = 0x4A374531
 SNAPSHOT_WORDS = 87
 TRACE_HEADER_WORDS = 24
 CALIBRATION_WORDS = 29
+STARTUP_HEADER_WORDS = 22
 MASK32 = 0xFFFFFFFF
 TOPICS = {SNAPSHOT_MAGIC: '/stm32/joint7_bench_snapshot',
           TRACE_MAGIC: '/stm32/joint7_bench_trace',
-          CALIBRATION_MAGIC: '/stm32/joint7_bench_calibration'}
+          CALIBRATION_MAGIC: '/stm32/joint7_bench_calibration',
+          STARTUP_MAGIC: '/stm32/joint7_bench_startup_trace'}
 # DM-J4310-2EC V1.1 manual v1.3 p18: RID20 Gr is a read-only float gear ratio.
 # This observation alone does not identify or qualify the attached motor.
 LOOP_REGISTERS = [('Gr', 20), ('I_BW', 24), ('KP_ASR', 25), ('KI_ASR', 26),
@@ -40,7 +43,11 @@ CALIBRATION_REGISTERS = [('TIMEOUT', 9, 'uint32'), ('Inertia', 12, 'float32'),
 META_NAMES = ('version', 'first_sequence', 'next_sequence', 'count', 'overwritten',
               'armed', 'triggered', 'frozen', 'trigger_kind', 'trigger_ms', 'tail_count')
 KINDS = {1: 'tx_enqueue_ok', 2: 'tx_enqueue_error', 3: 'rx',
-         4: 'accepted_v2', 5: 'stop', 6: 'trip'}
+         4: 'accepted_v2', 5: 'stop', 6: 'trip', 7: 'startup_start'}
+STARTUP_META_NAMES = ('version', 'armed', 'frozen', 'reason', 'count', 'start_ms',
+                      'enable_enqueued', 'enable_ms', 'command_sequence')
+STARTUP_REASONS = {0: 'none', 1: 'first_enable_window', 2: 'capacity_truncated',
+                   3: 'no_enable_timeout', 4: 'stop', 5: 'trip'}
 
 
 def require(condition, message):
@@ -78,12 +85,13 @@ def decode_meta(words):
     return meta
 
 
-def decode_record(words, sequence):
+def decode_record(words, sequence, startup=False):
     tick, tag, data0, data1 = words
     require(tag >> 22 == 0, 'trace tag has reserved bits')
     kind, axis = (tag >> 18) & 15, (tag >> 15) & 7
     can_id, dlc = tag & 0x7FF, (tag >> 11) & 15
     require(kind in KINDS and axis == 7, 'unsupported trace kind or axis')
+    require(kind != 7 or startup, 'startup marker in historical trace format')
     record = dict(sequence=sequence, mcu_tick_ms=tick, kind=KINDS[kind], axis=axis,
                   raw_words=list(words))
     if kind <= 3:
@@ -103,6 +111,8 @@ def decode_record(words, sequence):
             require(mode in (0, 1, 2, 3) and control_mode in (1, 2),
                     'accepted marker has unsupported mode')
             record.update(mode=mode, control_mode=control_mode, active_joint_mask=mask)
+        elif kind == 7:
+            require(data1 == 0, 'startup marker reserved value must be zero')
         else:
             record['fault_code' if kind == 5 else 'trip_reason'] = data1
     return record
@@ -195,6 +205,44 @@ def decode_message(message):
                                        read_mask=calibration[2], started_ms=calibration[3],
                                        completed_ms=calibration[4], registers=registers))
         return result
+    if words[0] == STARTUP_MAGIC:
+        require(len(words) >= STARTUP_HEADER_WORDS, 'truncated startup trace header')
+        require(words[19:22] == [256, 4, 0],
+                'invalid startup capacity, record size, or reserved word')
+        meta = dict(zip(STARTUP_META_NAMES, words[7:16]))
+        require(meta['version'] == 1, 'unsupported startup metadata version')
+        for flag in ('armed', 'frozen', 'enable_enqueued'):
+            require(meta[flag] in (0, 1), f'invalid startup {flag} flag')
+        require(meta['reason'] in STARTUP_REASONS, 'invalid startup freeze reason')
+        require(meta['count'] <= 256, 'invalid startup record count')
+        if not meta['armed']:
+            require(not any(meta[name] for name in STARTUP_META_NAMES[2:]),
+                    'startup metadata without arming')
+        else:
+            require(meta['count'] > 0, 'armed startup is missing its start record')
+        require(bool(meta['frozen']) == bool(meta['reason']), 'startup frozen/reason mismatch')
+        require(meta['enable_enqueued'] or not meta['enable_ms'],
+                'startup enable tick without enqueue')
+        if meta['enable_enqueued']:
+            require((meta['enable_ms'] - meta['start_ms']) & MASK32 < 500,
+                    'startup enable tick outside acquisition window')
+        if meta['reason'] == 1:
+            require(meta['enable_enqueued'], 'startup enable window without FC enqueue')
+        if meta['reason'] == 2:
+            require(meta['count'] == 256, 'startup capacity freeze without full buffer')
+        if meta['reason'] == 3:
+            require(not meta['enable_enqueued'], 'startup no-enable timeout after FC')
+        count, offset = words[17], words[16]
+        require(count <= 8 and len(words) == STARTUP_HEADER_WORDS + count * 4,
+                'startup page record count/length mismatch')
+        require(words[18] in (0, 1), 'invalid startup gap flag')
+        require(offset <= meta['count'] and offset + count <= meta['count'],
+                'startup page is outside retained prefix')
+        result.update(kind='startup_trace', startup_meta=meta, page_start=offset,
+                      page_count=count, gap=bool(words[18]), records=[
+                          decode_record(words[22 + i * 4:26 + i * 4], offset + i, startup=True)
+                          for i in range(count)])
+        return result
     require(len(words) >= TRACE_HEADER_WORDS, 'truncated trace header')
     require(words[21:24] == [512, 4, 0], 'invalid trace capacity, record size, or reserved word')
     count = words[19]
@@ -210,6 +258,106 @@ def decode_message(message):
                       decode_record(words[24 + i * 4:28 + i * 4], (words[18] + i) & MASK32)
                       for i in range(count)])
     return result
+
+
+def decode_startup_capture(pages):
+    if not pages:
+        return dict(status='not_captured', buffer_complete=False, startup_sequence_complete=False)
+    frozen = [page['startup_meta'] for page in pages if page['startup_meta']['frozen']]
+    require(bool(frozen), 'startup trace is not frozen; completeness cannot be established')
+    final = frozen[-1]
+    require(all(meta == final for meta in frozen), 'conflicting frozen startup metadata')
+    by_sequence = {}
+    for page in pages:
+        require(page['startup_meta'] == final, 'mixed live/frozen startup metadata')
+        for record in page['records']:
+            sequence = record['sequence']
+            require(sequence not in by_sequence or by_sequence[sequence] == record,
+                    f'conflicting duplicate startup record sequence {sequence}')
+            by_sequence[sequence] = record
+    missing = [index for index in range(final['count']) if index not in by_sequence]
+    require(not missing, f'missing startup records/pages: {len(missing)}; first={missing[:8]}')
+    records = [by_sequence[index] for index in range(final['count'])]
+    elapsed = [(record['mcu_tick_ms'] - final['start_ms']) & MASK32 for record in records]
+    # RX timestamps are taken at reception; an older queued RX can be consumed
+    # after a newer TX enqueue. Preserve this evidence without claiming that
+    # record insertion order is physical CAN wire order.
+    ticks_monotonic = all(before <= after for before, after in zip(elapsed, elapsed[1:]))
+    first = records[0]
+    evidence = dict(start_marker=(first['kind'] == 'startup_start' and
+                        first['mcu_tick_ms'] == final['start_ms'] and
+                        first['command_sequence'] == final['command_sequence']),
+                    accepted_v2=False, precise_read_request=False, precise_read_response=False,
+                    matching_position_preload=False, first_enable_enqueue=False,
+                    enabled_feedback=False)
+    accepted = next((index for index, record in enumerate(records)
+                     if record['kind'] == 'accepted_v2' and
+                     record['command_sequence'] == final['command_sequence'] and
+                     record['control_mode'] == 2 and record['active_joint_mask'] == 0x40 and
+                     record['mode'] in (0, 1)), None)
+    evidence['accepted_v2'] = accepted is not None
+
+    def can_record(record, kind, can_id):
+        return record['kind'] == kind and record.get('can_id') == can_id
+
+    # Use the first FC, rather than a later successful retry that might hide a
+    # premature enable. Only the immediately preceding accepted precise read
+    # and preload can establish the seed of this first enable attempt.
+    fc = next((index for index, record in enumerate(records)
+               if can_record(record, 'tx_enqueue_ok', '0x107') and
+               record['data_hex'] == 'fffffffffffffffc'), None)
+    evidence['first_enable_enqueue'] = (fc is not None and bool(final['enable_enqueued']) and
+        records[fc]['mcu_tick_ms'] == final['enable_ms'])
+    before_fc = len(records) if fc is None else fc
+    request_indices = [index for index, record in enumerate(records[:before_fc])
+                       if can_record(record, 'tx_enqueue_ok', '0x7ff') and
+                       record['data_hex'] == '0700335000000000' and elapsed[index] < 500 and
+                       accepted is not None and accepted < index]
+    evidence['precise_read_request'] = bool(request_indices)
+    response_index, response_bits = None, None
+    for index, record in enumerate(records[:before_fc]):
+        if (can_record(record, 'rx', '0x017') and record['data_hex'].startswith('07003350') and
+                any(request < index and 0 <= elapsed[index] - elapsed[request] <= 100
+                    for request in request_indices)):
+            bits = record['raw_words'][3]
+            if isinstance(float_bits(bits), float):
+                response_index, response_bits = index, bits
+    evidence['precise_read_response'] = response_index is not None
+    preload_index = None
+    if response_index is not None:
+        for index in range(response_index + 1, before_fc):
+            record = records[index]
+            if can_record(record, 'tx_enqueue_ok', '0x107'):
+                position_bits, velocity_bits = record['raw_words'][2:4]
+                velocity = float_bits(velocity_bits)
+                # Every final target before FC must still match the readback;
+                # a later different target invalidates an earlier good prefill.
+                preload_index = index if (position_bits == response_bits and
+                    0 <= elapsed[index] - elapsed[response_index] <= 100 and
+                    isinstance(velocity, float) and velocity > 0) else None
+    if preload_index is not None and fc is not None and elapsed[preload_index] > elapsed[fc]:
+        preload_index = None
+    evidence['matching_position_preload'] = preload_index is not None
+    if fc is not None:
+        evidence['enabled_feedback'] = any(
+            can_record(record, 'rx', '0x017') and record['data_hex'].startswith('17')
+            and 0 < signed((record['mcu_tick_ms'] - records[fc]['mcu_tick_ms']) & MASK32) < 100
+            for record in records[fc + 1:])
+    if accepted is not None and fc is not None:
+        evidence['accepted_v2'] = accepted < fc
+    if final['reason'] in (4, 5):
+        require(records[-1]['kind'] == ('stop' if final['reason'] == 4 else 'trip'),
+                'startup freeze is missing its stop/trip marker')
+    required = ('start_marker', 'accepted_v2', 'precise_read_request', 'precise_read_response',
+                'matching_position_preload', 'first_enable_enqueue', 'enabled_feedback')
+    incomplete = [key for key in required if not evidence[key]]
+    if final['reason'] in (2, 3):
+        incomplete.append(STARTUP_REASONS[final['reason']])
+    return dict(status='frozen_startup_prefix', buffer_complete=True,
+                startup_sequence_complete=not incomplete, freeze_reason=STARTUP_REASONS[final['reason']],
+                truncated=final['reason'] == 2, gap_seen=any(page['gap'] for page in pages),
+                record_ticks_monotonic=ticks_monotonic,
+                evidence=evidence, incomplete_reasons=incomplete, metadata=final, records=records)
 
 
 def decode_capture(messages):
@@ -233,6 +381,8 @@ def decode_capture(messages):
                        'the cumulative overflow counter before and after a test. '
                        'Calibration diagnostics are startup read observations; complete means '
                        'collection ended, not calibration success or motion admission.')
+    result['startup_trace'] = decode_startup_capture(
+        [message for message in decoded if message['kind'] == 'startup_trace'])
     if not pages:
         result['trace'] = dict(status='not_captured', retained_window_complete=False)
         return result

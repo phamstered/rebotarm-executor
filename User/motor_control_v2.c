@@ -2,7 +2,7 @@
 #include <math.h>
 #include <string.h>
 
-enum { WRITE_SEND, WRITE_WAIT, SETTLE, READ_SEND, READ_WAIT };
+enum { POSITION_SEND, POSITION_WAIT, WRITE_SEND, WRITE_WAIT, SETTLE, READ_SEND, READ_WAIT };
 static bool same_request(const MotorControlRequest *a, const MotorControlRequest *b)
 {
     return a->action == b->action && a->operation_id == b->operation_id &&
@@ -84,7 +84,7 @@ MotorControlResponse motor_v2_request(MotorControlV2 *s, const MotorControlReque
             s->error_code = MV2_OK;
             s->axis = 0;
             while (!(mask & (1U << s->axis))) ++s->axis;
-            s->phase = WRITE_SEND;
+            s->phase = s->target_mode == 2U ? POSITION_SEND : WRITE_SEND;
             s->phase_at = now;
             response.accepted = true;
         }
@@ -172,23 +172,45 @@ void motor_v2_step(MotorControlV2 *s, bool disabled_proven, uint32_t now,
 {
     if (!s->switching) return;
     if (!disabled_proven) { finish(s, MV2_FAILURE, MV2_NOT_DISABLED); return; }
-    if ((s->phase == WRITE_WAIT || s->phase == READ_WAIT) && (uint32_t)(now - s->phase_at) > 100U) {
+    if ((s->phase == POSITION_WAIT || s->phase == WRITE_WAIT || s->phase == READ_WAIT ||
+         (s->target_mode == 2U && s->phase == WRITE_SEND)) &&
+        (uint32_t)(now - s->phase_at) > MV2_REGISTER_TIMEOUT_MS) {
         finish(s, MV2_FAILURE, MV2_TIMEOUT); return;
     }
     if (s->phase == SETTLE && (uint32_t)(now - s->phase_at) >= 20U) s->phase = READ_SEND;
-    if (s->phase == WRITE_SEND || s->phase == READ_SEND) {
+    if (s->phase == POSITION_SEND || s->phase == WRITE_SEND || s->phase == READ_SEND) {
+        bool position = s->phase == POSITION_SEND;
         bool write = s->phase == WRITE_SEND;
         /* The old value is no longer verified once a write may reach the bus. */
         if (write) { s->verified_joint_mask &= ~(1U << s->axis); s->control_modes[s->axis] = 0; }
-        s->phase = write ? WRITE_WAIT : READ_WAIT;
+        s->phase = position ? POSITION_WAIT : write ? WRITE_WAIT : READ_WAIT;
         s->phase_at = now;
-        if (!send(s->axis, write, s->target_mode, context)) finish(s, MV2_FAILURE, MV2_READBACK);
+        if (!send(s->axis, position ? MV2_REG_PRECISE_POSITION : MV2_REG_MODE,
+                  write, s->target_mode, context)) finish(s, MV2_FAILURE, MV2_READBACK);
     }
 }
-void motor_v2_register_reply(MotorControlV2 *s, uint8_t axis, bool write,
-    uint32_t value, uint32_t now)
+void motor_v2_register_reply(MotorControlV2 *s, uint8_t axis, uint8_t rid, bool write,
+    uint32_t value, uint32_t received_ms, uint32_t now)
 {
-    if (!s->switching || axis != s->axis) return;
+    if (!s->switching || axis != s->axis ||
+        (int32_t)(received_ms - s->phase_at) < 0 ||
+        (uint32_t)(now - received_ms) > MV2_REGISTER_TIMEOUT_MS) return;
+    if ((uint32_t)(now - s->phase_at) > MV2_REGISTER_TIMEOUT_MS) {
+        finish(s, MV2_FAILURE, MV2_TIMEOUT); return;
+    }
+    if (s->phase == POSITION_WAIT) {
+        if (write || rid != MV2_REG_PRECISE_POSITION) return;
+        float position; memcpy(&position, &value, sizeof(position));
+        if (!isfinite(position)) { finish(s, MV2_FAILURE, MV2_NONFINITE); return; }
+        if (!isfinite(s->position_min[axis]) || !isfinite(s->position_max[axis]) ||
+            s->position_min[axis] > s->position_max[axis] ||
+            position < s->position_min[axis] || position > s->position_max[axis]) {
+            finish(s, MV2_FAILURE, MV2_LIMITS); return;
+        }
+        s->phase = WRITE_SEND; s->phase_at = now;
+        return;
+    }
+    if (rid != MV2_REG_MODE) return;
     if (write && s->phase == WRITE_WAIT) {
         if (value != s->target_mode) { finish(s, MV2_FAILURE, MV2_READBACK); return; }
         s->phase = SETTLE; s->phase_at = now;
@@ -198,6 +220,6 @@ void motor_v2_register_reply(MotorControlV2 *s, uint8_t axis, bool write,
         s->verified_joint_mask |= 1U << axis;
         do { ++s->axis; } while (s->axis < MV2_JOINTS && !(s->config_mask & (1U << s->axis)));
         if (s->axis == MV2_JOINTS) finish(s, MV2_SUCCESS, MV2_OK);
-        else { s->phase = WRITE_SEND; s->phase_at = now; }
+        else { s->phase = s->target_mode == 2U ? POSITION_SEND : WRITE_SEND; s->phase_at = now; }
     }
 }

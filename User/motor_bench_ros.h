@@ -8,6 +8,7 @@
 
 #if MOTOR_BENCH_JOINT7_POSVEL
 #include "motor_bench_trace.h"
+#include "motor_bench_startup_trace.h"
 /* UInt32MultiArray.data contains numeric uint32 words, not native struct bytes.
  * There are no CAN/ROS/RTOS calls, allocation, or state mutations here.
  * TX_OK means HAL accepted an enqueue; it is NOT transmission completion. */
@@ -15,6 +16,7 @@
 #define MOTOR_BENCH_ROS_SNAPSHOT_MAGIC 0x4a375331U /* J7S1 */
 #define MOTOR_BENCH_ROS_TRACE_MAGIC 0x4a375431U /* J7T1 */
 #define MOTOR_BENCH_ROS_CALIBRATION_MAGIC 0x4a374331U /* J7C1 */
+#define MOTOR_BENCH_ROS_STARTUP_MAGIC 0x4a374531U /* J7E1 */
 #define MOTOR_BENCH_ROS_SNAPSHOT_HEADER_WORDS 16U
 #define MOTOR_BENCH_ROS_ADMISSION_WORDS 37U
 #define MOTOR_BENCH_ROS_LOOP_WORDS 23U
@@ -25,6 +27,8 @@
 #define MOTOR_BENCH_ROS_TRACE_MAX_WORDS 56U
 #define MOTOR_BENCH_ROS_CALIBRATION_HEADER_WORDS 8U
 #define MOTOR_BENCH_ROS_CALIBRATION_WORDS 29U
+#define MOTOR_BENCH_ROS_STARTUP_HEADER_WORDS 22U
+#define MOTOR_BENCH_ROS_STARTUP_MAX_WORDS 54U
 
 typedef struct {
     uint32_t free_heap_bytes;
@@ -133,6 +137,51 @@ static inline size_t motor_bench_ros_encode_trace(uint32_t *out, size_t capacity
     out[22] = MOTOR_BENCH_ROS_RECORD_WORDS;
     for (uint32_t i = 0U; i < page->count; ++i) {
         uint32_t *record = out + MOTOR_BENCH_ROS_TRACE_HEADER_WORDS + i * 4U;
+        record[0] = records[i].ms;
+        record[1] = records[i].tag;
+        record[2] = records[i].data0;
+        record[3] = records[i].data1;
+    }
+    return words;
+}
+
+/* Independent startup prefix: 7..15 metadata (version, armed, frozen, reason,
+ * count, start tick, enable enqueued, enable tick, command sequence); 16 page
+ * start, 17 page count, 18 gap, 19 capacity, 20 record words, 21 reserved=0.
+ * This is a separate topic/magic; existing J7S1/J7T1/J7C1 remain unchanged. */
+static inline size_t motor_bench_ros_encode_startup(uint32_t *out, size_t capacity,
+    uint64_t boot_id, uint32_t now_ms, const MotorBenchStartupPage *page,
+    const MotorBenchTraceRecord *records)
+{
+    if (!out || !page || page->count > MOTOR_BENCH_TRACE_PAGE_MAX ||
+        (page->count && !records)) return 0U;
+    size_t words = MOTOR_BENCH_ROS_STARTUP_HEADER_WORDS +
+        page->count * MOTOR_BENCH_ROS_RECORD_WORDS;
+    if (capacity < words) return 0U;
+    memset(out, 0, words * sizeof(*out));
+    out[0] = MOTOR_BENCH_ROS_STARTUP_MAGIC;
+    out[1] = MOTOR_BENCH_ROS_VERSION;
+    out[2] = (uint32_t)words;
+    out[3] = (uint32_t)boot_id;
+    out[4] = (uint32_t)(boot_id >> 32);
+    out[5] = now_ms;
+    const MotorBenchStartupMeta *m = &page->meta;
+    out[7] = m->version;
+    out[8] = m->armed;
+    out[9] = m->frozen;
+    out[10] = m->reason;
+    out[11] = m->count;
+    out[12] = m->start_ms;
+    out[13] = m->enable_enqueued;
+    out[14] = m->enable_ms;
+    out[15] = m->command_sequence;
+    out[16] = page->first_sequence;
+    out[17] = page->count;
+    out[18] = page->gap;
+    out[19] = MOTOR_BENCH_STARTUP_CAPACITY;
+    out[20] = MOTOR_BENCH_ROS_RECORD_WORDS;
+    for (uint32_t i = 0U; i < page->count; ++i) {
+        uint32_t *record = out + MOTOR_BENCH_ROS_STARTUP_HEADER_WORDS + i * 4U;
         record[0] = records[i].ms;
         record[1] = records[i].tag;
         record[2] = records[i].data0;

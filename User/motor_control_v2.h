@@ -4,6 +4,9 @@
 #include <stdint.h>
 #define MV2_JOINTS 7U
 #define MV2_ALL 0x7fU
+#define MV2_REG_MODE 0x0aU
+#define MV2_REG_PRECISE_POSITION 0x50U
+#define MV2_REGISTER_TIMEOUT_MS 100U
 enum { MV2_OK, MV2_INVALID, MV2_IDENTITY, MV2_NOT_DISABLED, MV2_BUSY,
        MV2_UNSUPPORTED, MV2_MODE, MV2_LEASE, MV2_SEQUENCE, MV2_NONFINITE,
        MV2_LIMITS, MV2_FAULT, MV2_READBACK, MV2_TIMEOUT };
@@ -50,7 +53,7 @@ typedef struct {
     MotorControlResponse last_response;
     bool have_request, lease_has_frame;
 } MotorControlV2;
-typedef bool (*MotorRegisterSend)(uint8_t axis, bool write, uint32_t value, void *context);
+typedef bool (*MotorRegisterSend)(uint8_t axis, uint8_t rid, bool write, uint32_t value, void *context);
 void motor_v2_init(MotorControlV2 *s, uint64_t boot_id);
 bool motor_v2_mit_allowed(const MotorControlV2 *s);
 MotorControlResponse motor_v2_request(MotorControlV2 *s, const MotorControlRequest *r,
@@ -62,6 +65,6 @@ void motor_v2_fault(MotorControlV2 *s);
 void motor_v2_watchdog(MotorControlV2 *s, uint32_t now);
 void motor_v2_step(MotorControlV2 *s, bool disabled_proven, uint32_t now,
     MotorRegisterSend send, void *context);
-void motor_v2_register_reply(MotorControlV2 *s, uint8_t axis, bool write,
-    uint32_t value, uint32_t now);
+void motor_v2_register_reply(MotorControlV2 *s, uint8_t axis, uint8_t rid, bool write,
+    uint32_t value, uint32_t received_ms, uint32_t now);
 #endif

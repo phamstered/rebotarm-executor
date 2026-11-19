@@ -3,12 +3,14 @@
 #include <math.h>
 #include <stdio.h>
 #include <string.h>
-static unsigned writes, reads;
+static unsigned writes, reads, positions;
 static bool bus_ok = true;
-static bool send_reg(uint8_t axis, bool write, uint32_t value, void *context)
+static bool send_reg(uint8_t axis, uint8_t rid, bool write, uint32_t value, void *context)
 {
     (void)context; assert(axis < 7); assert(value == 1 || value == 2);
-    if (write) ++writes; else ++reads;
+    assert(rid == MV2_REG_MODE || (!write && rid == MV2_REG_PRECISE_POSITION));
+    if (rid == MV2_REG_PRECISE_POSITION) ++positions;
+    else if (write) ++writes; else ++reads;
     return bus_ok;
 }
 static MotorControlV2 fixture(void)
@@ -35,12 +37,18 @@ static MotorCommandV2 command(const MotorControlV2 *s, uint32_t sequence)
 static uint32_t complete_config(MotorControlV2 *s, uint32_t now)
 {
     while(s->switching) {
-        uint8_t axis=s->axis; motor_v2_step(s,true,now,send_reg,0);
+        uint8_t axis=s->axis;
+        if (s->target_mode==2) {
+            motor_v2_step(s,true,now,send_reg,0);
+            assert(s->control_modes[axis]==1);
+            motor_v2_register_reply(s,axis,MV2_REG_PRECISE_POSITION,false,0,now,now);
+        }
+        motor_v2_step(s,true,now,send_reg,0);
         assert(!(s->verified_joint_mask&(1U<<axis)));
-        motor_v2_register_reply(s,(axis+1)%7,true,s->target_mode,now); assert(s->switching);
-        motor_v2_register_reply(s,axis,true,s->target_mode,now);
+        motor_v2_register_reply(s,(axis+1)%7,MV2_REG_MODE,true,s->target_mode,now,now); assert(s->switching);
+        motor_v2_register_reply(s,axis,MV2_REG_MODE,true,s->target_mode,now,now);
         motor_v2_step(s,true,now+20,send_reg,0);
-        motor_v2_register_reply(s,axis,false,s->target_mode,now+21); now+=24;
+        motor_v2_register_reply(s,axis,MV2_REG_MODE,false,s->target_mode,now+21,now+21); now+=24;
     }
     assert(s->operation_state==MV2_SUCCESS); return now;
 }
@@ -58,7 +66,7 @@ int main(void)
     assert(!motor_v2_mit_allowed(&s));
     assert(motor_v2_request(&s,&r,true,0,42,0).accepted); assert(writes==0);
     bad=r; bad.active_joint_mask=1; assert(motor_v2_request(&s,&bad,true,0,42,0).error_code==MV2_INVALID);
-    uint32_t now=complete_config(&s,0); assert(writes==2 && reads==2); assert(s.control_epoch==2);
+    uint32_t now=complete_config(&s,0); assert(writes==2 && reads==2 && positions==2); assert(s.control_epoch==2);
     assert(s.control_modes[0]==2 && s.control_modes[1]==1 && s.control_modes[2]==2);
     r=request(&s,2,2,5); assert(motor_v2_request(&s,&r,true,0,42,now).accepted);
     uint32_t lease=s.lease_id; assert(lease);
@@ -102,12 +110,12 @@ int main(void)
     assert(s.operation_id==4 && s.operation_state==MV2_SUCCESS);
     /* Cancellation, failed writes, wrong readback and timeout never claim verification. */
     for(unsigned variant=0;variant<5;++variant) {
-        s=fixture(); s.pos_vel_supported_mask=1; r=request(&s,1,1,1);
+        s=fixture(); s.pos_vel_supported_mask=1; r=request(&s,1,1,1); r.control_mode=1;
         assert(motor_v2_request(&s,&r,true,0,42,0).accepted);
         if(variant==0) { motor_v2_disable(&s); assert(s.operation_state==MV2_CANCELLED); }
         else {
             bus_ok=variant!=1; motor_v2_step(&s,true,0,send_reg,0); bus_ok=true;
-            if(variant==2) motor_v2_register_reply(&s,0,true,1,1);
+            if(variant==2) motor_v2_register_reply(&s,0,MV2_REG_MODE,true,2,1,1);
             if(variant==3) motor_v2_step(&s,true,101,send_reg,0);
             if(variant==4) motor_v2_step(&s,false,1,send_reg,0);
             assert(s.operation_state==MV2_FAILURE && !(s.verified_joint_mask&1));
@@ -115,6 +123,33 @@ int main(void)
         assert(!s.switching && !s.lease_id && s.control_epoch==2);
         assert(!motor_v2_mit_allowed(&s));
     }
+    /* Exact 0x50 read is required before any mode write; irrelevant/stale
+     * replies cannot advance it, invalid/late values cannot arm it. */
+    for(unsigned variant=0;variant<8;++variant) {
+        s=fixture();s.pos_vel_supported_mask=1;r=request(&s,1,1,1);
+        assert(motor_v2_request(&s,&r,true,0,42,10).accepted);
+        unsigned before=writes;
+        motor_v2_step(&s,true,10,send_reg,0);
+        uint32_t bits=0;float p=variant==0?NAN:variant==1?3.0f:0.5f;
+        memcpy(&bits,&p,4);
+        if(variant==2) motor_v2_disable(&s);
+        uint8_t rid=variant==3?0x51:MV2_REG_PRECISE_POSITION;
+        uint32_t received=variant==4?9:11;
+        uint32_t now=variant==5?111:11;
+        motor_v2_register_reply(&s,variant==6?1:0,rid,variant==7,bits,received,now);
+        motor_v2_step(&s,true,111,send_reg,0);
+        assert(!s.switching && !s.lease_id && writes==before);
+        assert(s.operation_state==(variant==2?MV2_CANCELLED:MV2_FAILURE));
+        /* No 0x0a write was attempted; the old MIT readback stays true. */
+        assert(s.control_modes[0]==1 && (s.verified_joint_mask&1));
+    }
+    s=fixture();s.pos_vel_supported_mask=1;r=request(&s,1,1,1);
+    assert(motor_v2_request(&s,&r,true,0,42,0).accepted);
+    motor_v2_step(&s,true,0,send_reg,0);
+    motor_v2_register_reply(&s,0,MV2_REG_PRECISE_POSITION,false,0,1,1);
+    unsigned writes_before=writes;
+    motor_v2_step(&s,true,102,send_reg,0);
+    assert(s.operation_state==MV2_FAILURE && s.error_code==MV2_TIMEOUT && writes==writes_before);
     /* Only an unused, disabled grant gets a 500 ms handshake window. */
     s=fixture(); s.pos_vel_supported_mask=1; s.control_modes[0]=2;
     r=request(&s,2,1,1); assert(motor_v2_request(&s,&r,true,0,42,0).accepted);
