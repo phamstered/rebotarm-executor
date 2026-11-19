@@ -613,7 +613,7 @@ qualification. Record the actual version/parameter values with test evidence.
 
 During a joint7 V2 motion session only, the bench image also stops on actual
 feedback outside the configured position window without a tolerance expansion,
-absolute velocity above 0.05 rad/s, absolute reported effort above 0.30 N·m,
+absolute velocity above 0.1 rad/s, absolute reported effort above 0.30 N·m,
 nonfinite feedback, or feedback age over 100 ms (CAN RX timestamp). The control
 and safety paths use the existing lease revocation and all-axis DISABLE, clear
 POS support, and latch `trip_reason`, `trip_ms`, `trip_position`, `trip_velocity`
@@ -623,6 +623,9 @@ explicit DISABLE remains available and does not erase the diagnostic. Nothing
 automatically resets the MCU or restarts motion. Investigate the cause before
 an explicit restart/reflash. This is a feedback-triggered stop; it cannot impose
 a drive-internal current/torque ceiling or guarantee zero transient overshoot.
+The 0.1 rad/s feedback stop threshold is separate from the command speed cap
+(`MOTOR_BENCH_VELOCITY_MAX`, still at most 0.05 rad/s); it does not increase
+the requested speed. The half-opening diagnostic trial uses 0.005 rad/s.
 
 With the bench diagnostics, profile transaction, guard and queued STOP
 bookkeeping, local linked DTCMRAM use is 124328 bytes (Debug) / 124320 bytes
