@@ -73,7 +73,9 @@ jobs:
           /tmp/motor-bridge-bench-test
 
       - name: Prepare firmware interfaces
-        run: python3 scripts/prepare_microros_interfaces.py
+        run: |
+          python3 scripts/test_prepare_microros_interfaces.py
+          python3 scripts/prepare_microros_interfaces.py
 
       - name: Verify toolchain
         run: arm-none-eabi-gcc --version

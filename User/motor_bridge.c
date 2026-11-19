@@ -75,6 +75,13 @@ typedef struct {
     MotorCommandV2 command_v2;
     MotorControlV2 control;
     bool using_v2;
+    /* One asynchronous precise-position transaction per granted V2 lease. */
+    uint32_t seed_lease, seed_epoch, seed_mask, seed_read_at;
+    uint32_t seed_received_ms[MOTOR_BRIDGE_JOINT_COUNT];
+    float seed_position[MOTOR_BRIDGE_JOINT_COUNT];
+    uint32_t seed_enable_sent, seed_enabled_seen;
+    uint8_t seed_axis;
+    bool seed_waiting, seed_complete;
     uint32_t disable_ms;
     uint32_t received_feedback_ms[MOTOR_BRIDGE_JOINT_COUNT];
     bool have_disable;
@@ -113,6 +120,12 @@ static MotorBenchTraceRecord motor_bench_trace_records[MOTOR_BENCH_TRACE_CAPACIT
 #endif
     ;
 static MotorBenchTraceMeta motor_bench_trace_meta;
+static MotorBenchStartupMeta motor_bench_startup_meta;
+static MotorBenchTraceRecord motor_bench_startup_records[MOTOR_BENCH_STARTUP_CAPACITY]
+#if defined(__arm__) || defined(__thumb__)
+    __attribute__((section(".motor_bench_trace"), aligned(32)))
+#endif
+    ;
 static MotorBenchProfile motor_bench_profile;
 
 static void bench_trace_can(uint32_t kind, uint16_t can_id,
@@ -130,6 +143,8 @@ static void bench_trace_can(uint32_t kind, uint16_t can_id,
     taskENTER_CRITICAL();
     motor_bench_trace_append(&motor_bench_trace_meta, motor_bench_trace_records,
                              &record, HAL_GetTick());
+    motor_bench_startup_append(&motor_bench_startup_meta, motor_bench_startup_records,
+                               &record, HAL_GetTick());
     taskEXIT_CRITICAL();
 }
 
@@ -241,6 +256,22 @@ static bool disabled_proven(uint32_t now)
     return true;
 }
 
+/* This physical check deliberately does not replace disabled_proven(): an
+ * admitted V2 frame has already changed the logical mode away from DISABLE. */
+static bool stationary_disabled(uint32_t mask, uint32_t now)
+{
+    if (state.disable_pending || state.disable_tx_wait) return false;
+    for (uint32_t i = 0; i < MOTOR_BRIDGE_JOINT_COUNT; ++i) {
+        if (!(state.feedback_valid_mask & (1U << i)) ||
+            state.drive_status[i] != DAMIAO_STATUS_DISABLED ||
+            (int32_t)(state.received_feedback_ms[i] - state.disable_ms) <= 0 ||
+            (uint32_t)(now - state.received_feedback_ms[i]) > FEEDBACK_TIMEOUT_MS) return false;
+        if ((mask & (1U << i)) && (!isfinite(state.snapshot.velocity[i]) ||
+            fabsf(state.snapshot.velocity[i]) > 0.02f)) return false;
+    }
+    return true;
+}
+
 #if MOTOR_BENCH_JOINT7_POSVEL
 static MotorBenchProfileEnvironment bench_profile_environment(uint32_t now)
 {
@@ -302,17 +333,23 @@ static uint64_t boot_nonce(void)
     return nonce;
 }
 
-static bool runtime_register_send(uint8_t axis, bool write, uint32_t value, void *context)
+static bool runtime_register_send(uint8_t axis, uint8_t rid, bool write, uint32_t value, void *context)
 {
     (void)context;
     uint8_t data[DAMIAO_DLC];
-    if (write) damiao_encode_register_write_cmd(motor_ids[axis], DAMIAO_REG_CTRL_MODE, value, data);
-    else damiao_encode_register_read_cmd(motor_ids[axis], DAMIAO_REG_CTRL_MODE, data);
+    if (axis >= MOTOR_BRIDGE_JOINT_COUNT ||
+        (rid != MV2_REG_MODE && rid != MV2_REG_PRECISE_POSITION) ||
+        (write && (rid != MV2_REG_MODE || (value != 1U && value != 2U)))) return false;
+    if (write) damiao_encode_register_write_cmd(motor_ids[axis], rid, value, data);
+    else damiao_encode_register_read_cmd(motor_ids[axis], rid, data);
     return send_frame(damiao_get_register_can_id(), data);
 }
 
 static void request_disable(void)
 {
+    state.seed_lease = 0U;
+    state.seed_waiting = state.seed_complete = false;
+    state.seed_mask = state.seed_enable_sent = state.seed_enabled_seen = 0U;
     uint32_t required = 0U;
     for (uint32_t i = 0U; i < MOTOR_BRIDGE_JOINT_COUNT; i++) {
         if (state.control.control_modes[i] != 2U) required |= 1U << i;
@@ -386,10 +423,14 @@ static void set_mode(uint8_t mode)
     if (mode == MOTOR_MODE_DISABLE) motor_v2_disable(&state.control);
     if (state.snapshot.mode != mode) {
 #if MOTOR_BENCH_JOINT7_POSVEL
-        if (mode == MOTOR_MODE_DISABLE)
+        if (mode == MOTOR_MODE_DISABLE) {
             motor_bench_trace_trigger(&motor_bench_trace_meta, motor_bench_trace_records,
                 MOTOR_BENCH_TRACE_STOP, state.snapshot.last_command_sequence,
                 state.snapshot.fault_code, HAL_GetTick());
+            motor_bench_startup_stop(&motor_bench_startup_meta, motor_bench_startup_records,
+                MOTOR_BENCH_TRACE_STOP, state.snapshot.last_command_sequence,
+                state.snapshot.fault_code, HAL_GetTick());
+        }
 #endif
         if (mode == MOTOR_MODE_DISABLE) request_disable();
         state.snapshot.mode = mode;
@@ -589,6 +630,7 @@ void motor_bridge_init(void)
      * bounded calibration collection can run. */
     motor_bench_init_calibration((MotorBenchCalibrationDiagnostics *)&motor_bench_calibration_diagnostics);
     motor_bench_trace_init(&motor_bench_trace_meta, motor_bench_trace_records);
+    motor_bench_startup_init(&motor_bench_startup_meta, motor_bench_startup_records);
 #endif
     motor_v2_init(&state.control, boot_nonce());
 #if MOTOR_BENCH_JOINT7_POSVEL
@@ -739,6 +781,12 @@ bool motor_bridge_accept_command_v2(const MotorCommandV2 *command, uint32_t now_
                                      &marker, now_ms);
         }
 #endif
+        if (state.seed_lease != command->lease_id || state.seed_epoch != command->control_epoch) {
+            state.seed_lease = command->lease_id;
+            state.seed_epoch = command->control_epoch;
+            state.seed_waiting = state.seed_complete = false;
+            state.seed_mask = state.seed_enable_sent = state.seed_enabled_seen = 0U;
+        }
         state.have_disable = false;
         state.command_v2 = *command;
         state.using_v2 = true;
@@ -768,7 +816,9 @@ MotorControlResponse motor_bridge_control_request(const MotorControlRequest *req
     if (bench_latched_fault()) fault = bench_latched_fault();
     if (!state.initialized || state.zero_snapshot.busy) fault = MOTOR_FAULT_INIT;
     MotorControlResponse response = motor_v2_request(&state.control, request,
-        disabled_proven(now_ms), fault, state.snapshot.last_command_sequence, now_ms);
+        disabled_proven(now_ms) && (request->action != 1U || request->control_mode != 2U ||
+            stationary_disabled(request->active_joint_mask, now_ms)),
+        fault, state.snapshot.last_command_sequence, now_ms);
     if (response.accepted && request->action == 4U) {
 #if MOTOR_BENCH_JOINT7_POSVEL
         motor_bench_profile_cancel(&motor_bench_profile, now_ms);
@@ -793,6 +843,105 @@ void motor_bridge_get_control_snapshot(MotorControlSnapshot *snapshot)
     taskEXIT_CRITICAL();
 }
 
+static bool precise_seed_fail(uint16_t fault)
+{
+    state.snapshot.fault_code = fault;
+    set_mode(MOTOR_MODE_DISABLE);
+    (void)send_disable();
+    return false;
+}
+
+static bool precise_seed_identity(uint32_t now)
+{
+    return state.using_v2 && state.snapshot.mode != MOTOR_MODE_DISABLE &&
+        !state.control.switching && state.control.lease_id != 0U &&
+        state.seed_lease == state.control.lease_id &&
+        state.seed_epoch == state.control.control_epoch &&
+        state.command_v2.lease_id == state.control.lease_id &&
+        state.command_v2.source_id == state.control.owner_source_id &&
+        state.command_v2.active_joint_mask == state.control.selected_joint_mask &&
+        (uint32_t)(now - state.control.last_frame_ms) <= COMMAND_TIMEOUT_MS &&
+        state.snapshot.fault_code == MOTOR_FAULT_NONE && !state.communication_loss_latched;
+}
+
+static void precise_seed_reply(uint8_t axis, uint8_t rid, bool write,
+                               uint32_t value, uint32_t received_ms, uint32_t now)
+{
+    if (!state.seed_waiting || axis != state.seed_axis || write ||
+        rid != MV2_REG_PRECISE_POSITION ||
+        (int32_t)(received_ms - state.seed_read_at) < 0) return;
+    if (!precise_seed_identity(now) || !stationary_disabled(state.command_v2.active_joint_mask, now) ||
+        (uint32_t)(now - state.seed_read_at) > MV2_REGISTER_TIMEOUT_MS ||
+        (uint32_t)(now - received_ms) > MV2_REGISTER_TIMEOUT_MS) {
+        (void)precise_seed_fail(MOTOR_FAULT_FEEDBACK_TIMEOUT); return;
+    }
+    float position; memcpy(&position, &value, sizeof(position));
+    if (!isfinite(position) || !isfinite(state.control.position_min[axis]) ||
+        !isfinite(state.control.position_max[axis]) ||
+        state.control.position_min[axis] > state.control.position_max[axis] ||
+        position < state.control.position_min[axis] || position > state.control.position_max[axis]) {
+        (void)precise_seed_fail(MOTOR_FAULT_COMMAND_LIMIT); return;
+    }
+    state.seed_position[axis] = position;
+    state.seed_received_ms[axis] = received_ms;
+    state.seed_mask |= 1U << axis;
+    state.seed_waiting = false;
+}
+
+static bool precise_seed_step(uint32_t now)
+{
+    uint32_t selected = state.command_v2.active_joint_mask;
+    /* Once every enable was observed, retain the existing watchdog HOLD/STOP
+     * policy. Identity expiry must only prohibit an unfinished/new enable. */
+    if (state.seed_complete && (state.seed_enabled_seen & selected) == selected) return true;
+    if (!precise_seed_identity(now)) return precise_seed_fail(MOTOR_FAULT_COMMAND_LOSS_LATCHED);
+    if (state.seed_complete) {
+        if (state.snapshot.mode == MOTOR_MODE_HOLD && !state.hold_latched) {
+            for (uint32_t i = 0; i < MOTOR_BRIDGE_JOINT_COUNT; ++i)
+                if (selected & (1U << i)) state.hold_position[i] = state.seed_position[i];
+            state.hold_latched = true;
+        }
+        return true;
+    }
+    if (!stationary_disabled(selected, now)) return precise_seed_fail(MOTOR_FAULT_FEEDBACK_TIMEOUT);
+    if (state.seed_waiting) {
+        if ((uint32_t)(now - state.seed_read_at) > MV2_REGISTER_TIMEOUT_MS)
+            return precise_seed_fail(MOTOR_FAULT_FEEDBACK_TIMEOUT);
+        return false;
+    }
+    if ((state.seed_mask & selected) == selected) {
+        for (uint32_t i = 0; i < MOTOR_BRIDGE_JOINT_COUNT; ++i) {
+            if (!(selected & (1U << i))) continue;
+            if ((uint32_t)(now - state.seed_received_ms[i]) > MV2_REGISTER_TIMEOUT_MS)
+                return precise_seed_fail(MOTOR_FAULT_FEEDBACK_TIMEOUT);
+            if (state.snapshot.mode == MOTOR_MODE_HOLD) state.hold_position[i] = state.seed_position[i];
+        }
+        state.seed_complete = true;
+        if (state.snapshot.mode == MOTOR_MODE_HOLD) state.hold_latched = true;
+        return true;
+    }
+    uint8_t axis = 0;
+    while (!(selected & (1U << axis)) || (state.seed_mask & (1U << axis))) ++axis;
+#if MOTOR_BENCH_JOINT7_POSVEL
+    if (selected == 0x40U && !motor_bench_startup_meta.armed) {
+        motor_bench_startup_begin(&motor_bench_startup_meta, motor_bench_startup_records,
+                                  state.command_v2.sequence, now);
+        MotorBenchTraceRecord marker = {now,
+            motor_bench_trace_tag(MOTOR_BENCH_TRACE_ACCEPTED_V2, 7U, 0U, 0U),
+            state.command_v2.sequence, state.command_v2.mode |
+                ((uint32_t)state.command_v2.control_mode << 8) | (selected << 16)};
+        motor_bench_startup_append(&motor_bench_startup_meta, motor_bench_startup_records,
+                                   &marker, now);
+    }
+#endif
+    state.seed_axis = axis;
+    state.seed_read_at = now;
+    state.seed_waiting = true;
+    if (!runtime_register_send(axis, MV2_REG_PRECISE_POSITION, false, 0U, NULL))
+        return precise_seed_fail(MOTOR_FAULT_CAN_TX);
+    return false;
+}
+
 static void consume_feedback(uint32_t now_ms)
 {
     uint16_t can_id;
@@ -809,10 +958,12 @@ static void consume_feedback(uint32_t now_ms)
                     if (i == 6U)
                         motor_bench_profile_reply(&motor_bench_profile, can_id, data, received_ms, now_ms);
 #endif
-                    if (data[0] == motor_ids[i] && data[1] == 0U && data[3] == DAMIAO_REG_CTRL_MODE) {
+                    if (data[0] == motor_ids[i] && data[1] == 0U) {
                         uint32_t value; memcpy(&value, data + 4, sizeof(value));
-                        motor_v2_register_reply(&state.control, (uint8_t)i,
-                            damiao_is_register_write_ack(data), value, now_ms);
+                        motor_v2_register_reply(&state.control, (uint8_t)i, data[3],
+                            damiao_is_register_write_ack(data), value, received_ms, now_ms);
+                        precise_seed_reply((uint8_t)i, data[3], damiao_is_register_write_ack(data),
+                                           value, received_ms, now_ms);
                     }
                     break;
                 }
@@ -857,6 +1008,8 @@ static bool enforce_joint7_bench_feedback(uint32_t now_ms, bool was_active)
     if (!reason) return false;
     motor_bench_trace_trigger(&motor_bench_trace_meta, motor_bench_trace_records,
         MOTOR_BENCH_TRACE_TRIP, state.snapshot.last_command_sequence, reason, now_ms);
+    motor_bench_startup_stop(&motor_bench_startup_meta, motor_bench_startup_records,
+        MOTOR_BENCH_TRACE_TRIP, state.snapshot.last_command_sequence, reason, now_ms);
     if (!motor_bench_diagnostics.trip_reason) {
         motor_bench_diagnostics.trip_ms = now_ms;
         motor_bench_diagnostics.trip_position = state.snapshot.position[6];
@@ -877,6 +1030,7 @@ static void control_step_locked(uint32_t now_ms)
     uint8_t data[DAMIAO_DLC];
 #if MOTOR_BENCH_JOINT7_POSVEL
     motor_bench_trace_tick(&motor_bench_trace_meta, now_ms);
+    motor_bench_startup_tick(&motor_bench_startup_meta, now_ms);
     (void)motor_bench_profile_deadline(&motor_bench_profile, now_ms);
 #endif
     if (state.disable_pending) (void)send_disable();
@@ -901,7 +1055,9 @@ static void control_step_locked(uint32_t now_ms)
     }
 #endif
     if (state.disable_pending || state.disable_tx_wait) return;
-    motor_v2_step(&state.control, disabled_proven(now_ms), now_ms, runtime_register_send, NULL);
+    motor_v2_step(&state.control, disabled_proven(now_ms) &&
+        (state.control.target_mode != 2U || stationary_disabled(state.control.config_mask, now_ms)),
+        now_ms, runtime_register_send, NULL);
 
     for (uint32_t i = 0U; i < MOTOR_BRIDGE_JOINT_COUNT; i++) {
         /* A disabled Damiao drive does not stream feedback autonomously. */
@@ -949,6 +1105,15 @@ static void control_step_locked(uint32_t now_ms)
         return;
     }
 
+    if (state.using_v2) {
+        for (uint32_t i = 0; i < MOTOR_BRIDGE_JOINT_COUNT; ++i) {
+            if (!(state.command_v2.active_joint_mask & (1U << i)) && state.motor_enabled[i]) {
+                set_mode(MOTOR_MODE_DISABLE); (void)send_disable(); return;
+            }
+        }
+        if (!precise_seed_step(now_ms)) return;
+    }
+
     if (state.snapshot.mode == MOTOR_MODE_HOLD) {
         if (!state.hold_latched) {
             for (uint32_t i = 0U; i < MOTOR_BRIDGE_JOINT_COUNT; i++) {
@@ -992,13 +1157,26 @@ static void control_step_locked(uint32_t now_ms)
                 send_disable();
                 return;
             }
-            if ((uint32_t)(now_ms - state.last_enable_ms[i]) >=
-                    ENABLE_RETRY_MS) {
-                /* A drive may retain its previous target while disabled. Load
-                 * the admitted target before enable so old goals cannot run. */
+            if (state.using_v2 && (state.seed_enabled_seen & (1U << i))) {
+                (void)precise_seed_fail(MOTOR_FAULT_ENABLE_TIMEOUT); return;
+            }
+            if ((!state.using_v2 || !(state.seed_enable_sent & (1U << i))) &&
+                (uint32_t)(now_ms - state.last_enable_ms[i]) >= ENABLE_RETRY_MS) {
+                if (state.using_v2 && ((uint32_t)(now_ms - state.seed_received_ms[i]) >
+                    MV2_REGISTER_TIMEOUT_MS || !isfinite(state.snapshot.velocity[i]) ||
+                    fabsf(state.snapshot.velocity[i]) > 0.02f ||
+                    (uint32_t)(now_ms - state.received_feedback_ms[i]) > FEEDBACK_TIMEOUT_MS)) {
+                    (void)precise_seed_fail(MOTOR_FAULT_FEEDBACK_TIMEOUT); return;
+                }
+                /* Seven synchronized disabled feedback requests can occupy
+                 * seven of the eight hardware slots in this same cycle. Keep
+                 * preload+FC together; defer without a send or wait until two
+                 * slots are free. Seed age, lease and STOP gates still apply. */
+                if (state.using_v2 && fdcan1_tx_free() < 2U) return;
+                /* Load a fresh precise hold seed before FC; explicit TRACK
+                 * targets begin only after all enable feedback is observed. */
                 if (state.using_v2) {
-                    damiao_encode_pos_vel_cmd(state.snapshot.mode == MOTOR_MODE_HOLD ?
-                        state.hold_position[i] : state.command_v2.position[i],
+                    damiao_encode_pos_vel_cmd(state.seed_position[i],
                         state.command_v2.velocity_limit[i], data);
                     if (!send_frame(control_can_id(i), data)) {
                         state.snapshot.fault_code = MOTOR_FAULT_CAN_TX;
@@ -1013,9 +1191,14 @@ static void control_step_locked(uint32_t now_ms)
                     return;
                 }
                 state.last_enable_ms[i] = now_ms;
+                if (state.using_v2) state.seed_enable_sent |= 1U << i;
             }
         } else {
+            if (state.using_v2 && !(state.seed_enable_sent & (1U << i))) {
+                (void)precise_seed_fail(MOTOR_FAULT_ENABLE_TIMEOUT); return;
+            }
             state.enable_pending[i] = false;
+            if (state.using_v2) state.seed_enabled_seen |= 1U << i;
         }
     }
     if (!all_enabled) {
@@ -1187,6 +1370,16 @@ void motor_bridge_get_bench_snapshot(MotorBenchSnapshot *snapshot)
     snapshot->trace = motor_bench_trace_meta;
     snapshot->calibration = motor_bench_calibration_diagnostics;
     taskEXIT_CRITICAL();
+}
+
+uint32_t motor_bridge_copy_bench_startup_trace(uint32_t start_sequence,
+    MotorBenchTraceRecord *output, uint32_t capacity, MotorBenchStartupPage *page)
+{
+    taskENTER_CRITICAL();
+    uint32_t count = motor_bench_startup_copy(&motor_bench_startup_meta,
+        motor_bench_startup_records, start_sequence, output, capacity, page);
+    taskEXIT_CRITICAL();
+    return count;
 }
 
 uint32_t motor_bridge_copy_bench_trace(uint32_t start_sequence,

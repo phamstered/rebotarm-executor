@@ -270,6 +270,101 @@ static void test_unselected_enabled_axis_stops_with_backpressure(void)
     assert(full_send_attempts == 0 && state.snapshot.fault_code == MOTOR_FAULT_NONE);
 }
 
+static MotorCommandV2 seed_with_synchronized_poll_collision(void)
+{
+    fixture();
+    state.control.verified_joint_mask = MV2_ALL;
+    state.control.pos_vel_supported_mask = 0x40;
+    state.control.owner_source_id = 5;
+    state.control.selected_joint_mask = 0x40;
+    state.control.lease_id = 1;
+    state.control.last_frame_ms = 148;
+    state.disable_ms = 99;
+    for (unsigned i = 0; i < 7; ++i) {
+        state.control.control_modes[i] = i == 6 ? 2 : 1;
+        state.control.position_min[i] = -2;
+        state.control.position_max[i] = 2;
+        state.control.velocity_limit_max[i] = 1;
+        state.received_feedback_ms[i] = state.snapshot.last_feedback_ms[i] = 140;
+        state.last_feedback_request_ms[i] = 100;
+    }
+    clock_ms = 148;
+    MotorCommandV2 command = {.boot_id = 42, .control_epoch = 1, .source_id = 5,
+        .lease_id = 1, .sequence = 1, .mode = MOTOR_MODE_HOLD,
+        .control_mode = 2, .active_joint_mask = 0x40};
+    command.velocity_limit[6] = 0.02f;
+    assert(motor_bridge_accept_command_v2(&command, clock_ms));
+    motor_bridge_control_step(clock_ms);
+    assert(accepted_count == 1 && accepted[0].id == 0x7ff &&
+        accepted[0].data[3] == MV2_REG_PRECISE_POSITION && state.seed_waiting);
+    drain(TX_CAPACITY);
+    /* The response arrives before the next 4 ms cycle; that cycle is also the
+     * 52 ms synchronized poll deadline for all seven disabled motors. */
+    BspFdcanFrame *reply = &rx_queue[rx_count++];
+    memset(reply, 0, sizeof(*reply));
+    reply->id = feedback_ids[6];
+    reply->received_ms = 150;
+    damiao_encode_register_read_cmd(7, MV2_REG_PRECISE_POSITION, reply->data);
+    float precise = 0.123456f;
+    memcpy(reply->data + 4, &precise, sizeof(precise));
+    clock_ms = 152;
+    motor_bridge_control_step(clock_ms);
+    assert(state.seed_complete && state.hold_position[6] == precise);
+    assert(tx_count == 7 && fdcan1_tx_free() == 1 && accepted_count == 8);
+    assert(state.snapshot.fault_code == MOTOR_FAULT_NONE && !state.seed_enable_sent);
+    assert(full_send_attempts == 0);
+    for (unsigned i = 0; i < accepted_count; ++i)
+        assert(accepted[i].id == 0x7ff); /* No partial preload or premature FC. */
+    return command;
+}
+
+static void test_precise_enable_fifo_reservation(void)
+{
+    (void)seed_with_synchronized_poll_collision();
+    motor_bridge_control_step(clock_ms);
+    assert(clock_ms == 152 && accepted_count == 8 && full_send_attempts == 0);
+    /* One transmitted query frees the second slot: enqueue exactly preload
+     * then FC, without waiting for an entirely empty hardware queue. */
+    drain(1);
+    clock_ms = 156;
+    motor_bridge_control_step(clock_ms);
+    assert(accepted_count == 10 && tx_count == 8 && full_send_attempts == 0);
+    float position;
+    memcpy(&position, accepted[8].data, sizeof(position));
+    assert(accepted[8].id == 0x107 && position == 0.123456f);
+    assert(accepted[9].id == 0x107 && accepted[9].data[7] == 0xfc);
+    assert(state.seed_enable_sent == 0x40 && state.snapshot.fault_code == MOTOR_FAULT_NONE);
+
+    (void)seed_with_synchronized_poll_collision();
+    MotorBridgeCommand stop = disable(2);
+    assert(motor_bridge_accept_command(&stop, ++clock_ms));
+    motor_bridge_control_step(clock_ms);
+    assert(state.disable_pending && !state.control.lease_id && !state.seed_complete);
+    drain(TX_CAPACITY);
+    motor_bridge_control_step(++clock_ms);
+    for (unsigned i = 0; i < accepted_count; ++i) assert(accepted[i].data[7] != 0xfc);
+    assert(full_send_attempts == 0);
+
+    for (unsigned renew_lease = 0; renew_lease < 2; ++renew_lease) {
+        MotorCommandV2 command = seed_with_synchronized_poll_collision();
+        if (renew_lease) {
+            command.sequence = 2;
+            assert(motor_bridge_accept_command_v2(&command, 200));
+        }
+        /* A delayed task/bus recovery must not send an old seed just because
+         * slots become available. Refresh physical feedback, but not 0x50. */
+        drain(TX_CAPACITY);
+        clock_ms = 253;
+        for (unsigned i = 0; i < 7; ++i) push_feedback(i, clock_ms);
+        motor_bridge_control_step(clock_ms);
+        assert(state.snapshot.mode == MOTOR_MODE_DISABLE && !state.control.lease_id);
+        assert(state.snapshot.fault_code == (renew_lease ? MOTOR_FAULT_FEEDBACK_TIMEOUT :
+                                                         MOTOR_FAULT_COMMAND_LOSS_LATCHED));
+        for (unsigned i = 0; i < accepted_count; ++i) assert(accepted[i].data[7] != 0xfc);
+        assert(full_send_attempts == 0);
+    }
+}
+
 static void test_startup_wait_is_bounded(void)
 {
     fixture();
@@ -332,6 +427,7 @@ int main(void)
     test_hard_error_keeps_stop_pending();
     test_new_unknown_mode_adds_stop_channel();
     test_unselected_enabled_axis_stops_with_backpressure();
+    test_precise_enable_fifo_reservation();
     test_startup_wait_is_bounded();
     test_real_boot_orders_stop_before_feedback();
     test_failed_boot_still_completes_stop_at_runtime();

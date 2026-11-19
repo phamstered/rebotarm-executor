@@ -35,7 +35,8 @@
 ## 构建 / 烧录 / 监控
 
 需本机已安装 `arm-none-eabi-gcc`、CMake、Ninja；烧录另需 ST-Link 或 OpenOCD。
-首次构建或 `interfaces/` 消息更新后，先准备子模块并生成对应的 micro-ROS 静态库：
+首次构建、`interfaces/` 消息或实体池需求更新后，先准备子模块并生成对应的 micro-ROS 静态库。
+准备脚本保留其他构建设置，并确保至少 11 个 publisher（生产 6 个、台架另加 5 个）；旧库不能仅修改头文件代替重建：
 
 ```bash
 git submodule update --init --recursive

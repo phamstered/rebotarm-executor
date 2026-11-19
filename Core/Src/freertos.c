@@ -722,7 +722,14 @@ static uint32_t published_zero_signature = UINT32_MAX;
 static uint32_t last_zero_publish_ms;
 static uint32_t last_diagnostics_publish_ms;
 #if MOTOR_BENCH_JOINT7_POSVEL
+/* Six normal plus five bench publishers; fail at build time rather than
+ * reconnect forever with an undersized micro-ROS static entity pool. */
+_Static_assert(RMW_UXRCE_MAX_PUBLISHERS >= 11, "bench requires 11 micro-ROS publishers");
+_Static_assert(MOTOR_BENCH_ROS_STARTUP_MAX_WORDS <= MOTOR_BENCH_ROS_TRACE_MAX_WORDS,
+               "startup and tail trace share their serialization buffer");
 static rcl_publisher_t bench_snapshot_publisher;
+static rcl_publisher_t bench_startup_publisher;
+static std_msgs__msg__UInt32MultiArray bench_startup_message;
 static rcl_publisher_t bench_trace_publisher;
 static rcl_publisher_t bench_calibration_publisher;
 static std_msgs__msg__UInt32MultiArray bench_calibration_message;
@@ -740,6 +747,8 @@ static uint32_t last_bench_snapshot_ms;
 static uint32_t last_bench_poll_ms;
 static uint32_t last_bench_trace_ms;
 static uint32_t bench_trace_sequence;
+static uint32_t bench_startup_sequence;
+static bool bench_publish_startup_next;
 #endif
 
 enum {
@@ -961,9 +970,30 @@ static void publish_bench_diagnostics(uint32_t now_ms)
     }
     last_bench_snapshot_ms = now_ms;
   }
-  if (bench.trace.frozen &&
-      (uint32_t)(now_ms - last_bench_trace_ms) >= 50U) {
-    MotorBenchTraceRecord records[MOTOR_BENCH_TRACE_PAGE_MAX];
+  if ((uint32_t)(now_ms - last_bench_trace_ms) < 50U) return;
+  MotorBenchTraceRecord records[MOTOR_BENCH_TRACE_PAGE_MAX];
+  MotorBenchStartupPage startup_page;
+  (void)motor_bridge_copy_bench_startup_trace(bench_startup_sequence,
+      records, MOTOR_BENCH_TRACE_PAGE_MAX, &startup_page);
+  bool startup_ready = startup_page.meta.frozen && startup_page.meta.count != 0U;
+  /* One page per 50 ms across both topics; when both are ready each gets
+   * 10 Hz. rcl_publish serializes synchronously, so the backing words can be
+   * reused without a second static payload allocation. */
+  if (startup_ready && (bench_publish_startup_next || !bench.trace.frozen)) {
+    size_t words = motor_bench_ros_encode_startup(bench_trace_words,
+      MOTOR_BENCH_ROS_TRACE_MAX_WORDS, control.control.boot_id, now_ms,
+      &startup_page, records);
+    if (words != 0U) {
+      bench_startup_message.data.size = words;
+      if (rcl_publish(&bench_startup_publisher, &bench_startup_message,
+                      NULL) == RCL_RET_OK) {
+        bench_startup_sequence = startup_page.first_sequence + startup_page.count;
+        if (bench_startup_sequence == startup_page.meta.count) bench_startup_sequence = 0U;
+      } else microros_diagnostics.publish_failure_count++;
+    }
+    bench_publish_startup_next = false;
+    last_bench_trace_ms = now_ms;
+  } else if (bench.trace.frozen) {
     MotorBenchTracePage page;
     (void)motor_bridge_copy_bench_trace(bench_trace_sequence, records,
                                       MOTOR_BENCH_TRACE_PAGE_MAX, &page);
@@ -979,6 +1009,7 @@ static void publish_bench_diagnostics(uint32_t now_ms)
           bench_trace_sequence = page.meta.first_sequence;
       } else microros_diagnostics.publish_failure_count++;
     }
+    bench_publish_startup_next = true;
     last_bench_trace_ms = now_ms;
   }
 }
@@ -1136,6 +1167,7 @@ static bool init_ros_messages(void)
 #if MOTOR_BENCH_JOINT7_POSVEL
   if (!std_msgs__msg__UInt32MultiArray__init(&bench_snapshot_message) ||
       !std_msgs__msg__UInt32MultiArray__init(&bench_trace_message) ||
+      !std_msgs__msg__UInt32MultiArray__init(&bench_startup_message) ||
       !std_msgs__msg__UInt32MultiArray__init(&bench_calibration_message) ||
       !std_msgs__msg__UInt32MultiArray__init(&bench_profile_request_message) ||
       !std_msgs__msg__UInt32MultiArray__init(&bench_profile_status_message)) return false;
@@ -1144,6 +1176,8 @@ static bool init_ros_messages(void)
   bench_snapshot_message.data.capacity = MOTOR_BENCH_ROS_SNAPSHOT_WORDS;
   bench_trace_message.data.data = bench_trace_words;
   bench_trace_message.data.capacity = MOTOR_BENCH_ROS_TRACE_MAX_WORDS;
+  bench_startup_message.data.data = bench_trace_words;
+  bench_startup_message.data.capacity = MOTOR_BENCH_ROS_TRACE_MAX_WORDS;
   bench_calibration_message.data.data = bench_calibration_words;
   bench_calibration_message.data.capacity = MOTOR_BENCH_ROS_CALIBRATION_WORDS;
   bench_profile_request_message.data.data = bench_profile_request_words;
@@ -1256,6 +1290,8 @@ void StartMicrorosTask(void *argument)
 #if MOTOR_BENCH_JOINT7_POSVEL
     bench_snapshot_publisher = rcl_get_zero_initialized_publisher();
     bench_trace_publisher = rcl_get_zero_initialized_publisher();
+    bench_startup_publisher = rcl_get_zero_initialized_publisher();
+    bool bench_startup_publisher_ready = false;
     bool bench_snapshot_publisher_ready = false;
     bool bench_trace_publisher_ready = false;
     bench_calibration_publisher = rcl_get_zero_initialized_publisher();
@@ -1341,6 +1377,10 @@ void StartMicrorosTask(void *argument)
           &bench_trace_publisher, &node,
           ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, UInt32MultiArray),
           "/stm32/joint7_bench_trace") == RCL_RET_OK;
+      bench_startup_publisher_ready = rclc_publisher_init_best_effort(
+          &bench_startup_publisher, &node,
+          ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, UInt32MultiArray),
+          "/stm32/joint7_bench_startup_trace") == RCL_RET_OK;
       bench_calibration_publisher_ready = rclc_publisher_init_best_effort(
           &bench_calibration_publisher, &node,
           ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, UInt32MultiArray),
@@ -1364,7 +1404,7 @@ void StartMicrorosTask(void *argument)
         zero_status_publisher_ready && microros_diagnostics_publisher_ready &&
 #if MOTOR_BENCH_JOINT7_POSVEL
         bench_snapshot_publisher_ready && bench_trace_publisher_ready &&
-        bench_calibration_publisher_ready &&
+        bench_calibration_publisher_ready && bench_startup_publisher_ready &&
         bench_profile_publisher_ready && bench_profile_subscription_ready &&
 #endif
         timer_ready) {
@@ -1408,6 +1448,8 @@ void StartMicrorosTask(void *argument)
       last_bench_poll_ms = 0U;
       last_bench_trace_ms = 0U;
       bench_trace_sequence = 0U;
+      bench_startup_sequence = 0U;
+      bench_publish_startup_next = true;
 #endif
       microros_diagnostics.session_generation++;
       microros_diagnostics.consecutive_ping_failures = 0U;
@@ -1485,6 +1527,7 @@ void StartMicrorosTask(void *argument)
     if (bench_profile_subscription_ready) fini_result = rcl_subscription_fini(&bench_profile_subscription, &node);
     if (bench_profile_publisher_ready) fini_result = rcl_publisher_fini(&bench_profile_publisher, &node);
     if (bench_calibration_publisher_ready) fini_result = rcl_publisher_fini(&bench_calibration_publisher, &node);
+    if (bench_startup_publisher_ready) fini_result = rcl_publisher_fini(&bench_startup_publisher, &node);
     if (bench_trace_publisher_ready) fini_result = rcl_publisher_fini(&bench_trace_publisher, &node);
     if (bench_snapshot_publisher_ready) fini_result = rcl_publisher_fini(&bench_snapshot_publisher, &node);
 #endif

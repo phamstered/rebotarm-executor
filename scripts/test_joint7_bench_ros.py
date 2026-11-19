@@ -31,9 +31,211 @@ class BenchRosTest(unittest.TestCase):
         command[command.index('-o') + 1] = str(production)
         subprocess.run(command + ['-DMOTOR_BENCH_JOINT7_POSVEL=0'], check=True, capture_output=True)
         subprocess.run([str(production)], check=True, capture_output=True)
+        startup_binary = cls.directory / 'startup'
+        subprocess.run(['cc', '-std=c11', '-Wall', '-Wextra', '-Werror',
+                        '-I', str(ROOT / 'User'), '-DMOTOR_BENCH_JOINT7_POSVEL=1',
+                        '-DMOTOR_BENCH_POSITION_MIN=0.48f', '-DMOTOR_BENCH_POSITION_MAX=0.51f',
+                        '-DMOTOR_BENCH_VELOCITY_MAX=0.05f',
+                        str(ROOT / 'scripts/test_motor_bench_startup_trace.c'),
+                        '-o', str(startup_binary)], check=True, capture_output=True)
+        subprocess.run([str(startup_binary)], check=True, capture_output=True)
+        cls.startup_fixture = [json.loads(line) for line in subprocess.check_output(
+            [str(startup_binary), '--emit'], text=True).splitlines()]
 
     def setUp(self):
         self.snapshot, self.trace, self.calibration = copy.deepcopy(self.fixture)
+        self.startup = copy.deepcopy(self.startup_fixture)
+
+    def startup_with_records(self, records, **metadata):
+        header = self.startup[0]['data'][:22]
+        header[11] = len(records)
+        indices = dict(version=7, armed=8, frozen=9, reason=10, count=11,
+                       start_ms=12, enable_enqueued=13, enable_ms=14, command_sequence=15)
+        for name, value in metadata.items():
+            header[indices[name]] = value
+        pages = []
+        for offset in range(0, len(records), 8):
+            chunk = records[offset:offset + 8]
+            words = header[:] + [word for record in chunk for word in record]
+            words[2], words[16], words[17] = len(words), offset, len(chunk)
+            pages.append(dict(data=words))
+        return pages
+
+    def startup_raw_records(self):
+        return [message['data'][index:index + 4] for message in self.startup
+                for index in range(22, len(message['data']), 4)]
+
+    def test_startup_c_prefix_survives_long_run_and_decodes_independently_of_tail(self):
+        result = decode_capture([self.startup[1], self.startup[0], self.startup[1]])
+        startup = result['startup_trace']
+        self.assertEqual(result['trace']['status'], 'not_captured')
+        self.assertTrue(startup['buffer_complete'])
+        self.assertTrue(startup['startup_sequence_complete'])
+        self.assertTrue(all(startup['evidence'].values()))
+        self.assertEqual(startup['metadata']['command_sequence'], 123)
+        self.assertEqual(startup['records'][1]['mode'], 0)  # actual first-enable HOLD
+        self.assertEqual(startup['freeze_reason'], 'first_enable_window')
+        self.assertEqual([record['kind'] for record in startup['records'][:6]],
+                         ['startup_start', 'accepted_v2', 'tx_enqueue_ok', 'rx',
+                          'tx_enqueue_ok', 'tx_enqueue_ok'])
+        self.assertFalse(result['transmission_completion_proven'])
+        self.assertFalse(result['motion_success_proven'])
+        combined = decode_capture(self.fixture + self.startup)
+        self.assertTrue(combined['trace']['retained_window_complete'])
+        self.assertEqual(combined['startup_trace'], startup)
+        self.assertEqual(decode_capture(self.fixture)['startup_trace']['status'], 'not_captured')
+
+    def test_startup_hold_and_track_acceptance_must_precede_precise_seed_read(self):
+        for mode in (0, 1):
+            records = self.startup_raw_records()
+            records[1][3] = mode | (2 << 8) | (0x40 << 16)
+            startup = decode_capture(self.startup_with_records(records))['startup_trace']
+            self.assertTrue(startup['startup_sequence_complete'])
+        for mode in (2, 3):
+            records = self.startup_raw_records()
+            records[1][3] = mode | (2 << 8) | (0x40 << 16)
+            self.assertFalse(decode_capture(self.startup_with_records(records))[
+                'startup_trace']['startup_sequence_complete'])
+        records = self.startup_raw_records()
+        records[1], records[4] = records[4], records[1]
+        records[1][0], records[4][0] = 100, 103
+        startup = decode_capture(self.startup_with_records(records))['startup_trace']
+        self.assertFalse(startup['startup_sequence_complete'])
+        self.assertFalse(startup['evidence']['precise_read_request'])
+        records = self.startup_raw_records()
+        for record in records[3:]:
+            record[0] += 100
+        # A matching response received >100 ms after its read is stale.
+        startup = decode_capture(self.startup_with_records(records, enable_ms=204))['startup_trace']
+        self.assertFalse(startup['evidence']['precise_read_response'])
+
+    def test_startup_missing_page_missing_head_and_conflicting_duplicates_are_detected(self):
+        for pages in (self.startup[:1], self.startup[1:]):
+            with self.assertRaisesRegex(ValueError, 'missing startup'):
+                decode_capture(pages)
+        conflict = copy.deepcopy(self.startup[0])
+        conflict['data'][24] ^= 1
+        with self.assertRaisesRegex(ValueError, 'conflicting duplicate startup'):
+            decode_capture(self.startup + [conflict])
+        conflict = copy.deepcopy(self.startup[1])
+        conflict['data'][15] ^= 1
+        with self.assertRaisesRegex(ValueError, 'conflicting frozen startup'):
+            decode_capture(self.startup + [conflict])
+        records = self.startup_raw_records()
+        # All exported words can be present while the acquisition lacks START.
+        records[0] = records[1][:]
+        startup = decode_capture(self.startup_with_records(records))['startup_trace']
+        self.assertTrue(startup['buffer_complete'])
+        self.assertFalse(startup['startup_sequence_complete'])
+        self.assertIn('start_marker', startup['incomplete_reasons'])
+
+    def test_startup_each_required_stage_is_proven_by_records_not_frozen_metadata(self):
+        cases = [(1, 2, 999, 'accepted_v2'),  # wrong command sequence
+                 (2, 2, 0x51330007, 'precise_read_request'),
+                 (3, 2, 0x51330007, 'precise_read_response'),
+                 (4, 2, 0x3f000001, 'matching_position_preload'),
+                 (4, 3, 0x7f800000, 'matching_position_preload'),
+                 (4, 3, 0, 'matching_position_preload'),
+                 (5, 3, 0xfdffffff, 'first_enable_enqueue')]
+        for index, word, replacement, evidence in cases:
+            records = self.startup_raw_records()
+            records[index][word] = replacement
+            with self.subTest(evidence=evidence, word=word):
+                startup = decode_capture(self.startup_with_records(records))['startup_trace']
+                self.assertFalse(startup['startup_sequence_complete'])
+                self.assertFalse(startup['evidence'][evidence])
+        records = self.startup_raw_records()
+        for record in records[6:]:
+            record[2] = 0x07  # output disabled, still a valid frame
+        startup = decode_capture(self.startup_with_records(records))['startup_trace']
+        self.assertFalse(startup['evidence']['enabled_feedback'])
+        self.assertFalse(startup['startup_sequence_complete'])
+        # FC TX_ERROR does not constitute a successful enable enqueue.
+        records = self.startup_raw_records()
+        records[5][1] = (records[5][1] & ~(15 << 18)) | (2 << 18)
+        startup = decode_capture(self.startup_with_records(records))['startup_trace']
+        self.assertFalse(startup['evidence']['first_enable_enqueue'])
+
+    def test_startup_capacity_timeout_stop_and_trip_have_explicit_outcomes(self):
+        records = self.startup_raw_records()
+        while len(records) < 256:
+            records.append(records[-1][:])
+        startup = decode_capture(self.startup_with_records(records, reason=2))['startup_trace']
+        self.assertTrue(startup['buffer_complete'])
+        self.assertTrue(startup['truncated'])
+        self.assertFalse(startup['startup_sequence_complete'])
+        self.assertIn('capacity_truncated', startup['incomplete_reasons'])
+        records = self.startup_raw_records()[:3]
+        startup = decode_capture(self.startup_with_records(
+            records, reason=3, enable_enqueued=0, enable_ms=0))['startup_trace']
+        self.assertEqual(startup['freeze_reason'], 'no_enable_timeout')
+        self.assertFalse(startup['startup_sequence_complete'])
+        for reason, kind in ((4, 5), (5, 6)):
+            records = self.startup_raw_records()
+            records.append([108, (7 << 15) | (kind << 18), 124, 0])
+            startup = decode_capture(self.startup_with_records(records, reason=reason))['startup_trace']
+            self.assertTrue(startup['startup_sequence_complete'])
+            self.assertEqual(startup['freeze_reason'], 'stop' if reason == 4 else 'trip')
+            with self.assertRaisesRegex(ValueError, 'missing its stop/trip marker'):
+                decode_capture(self.startup_with_records(records[:-1], reason=reason))
+
+    def test_startup_order_wrong_seed_later_overwrite_and_wrap_are_checked(self):
+        records = self.startup_raw_records()
+        # A later mismatched preload invalidates an earlier matching preload.
+        bad_preload = records[4][:]
+        bad_preload[2] ^= 1
+        records.insert(5, bad_preload)
+        self.assertFalse(decode_capture(self.startup_with_records(records))[
+            'startup_trace']['startup_sequence_complete'])
+        records = self.startup_raw_records()
+        records[4], records[5] = records[5], records[4]
+        records[4][0], records[5][0] = 103, 104
+        startup = decode_capture(self.startup_with_records(records, enable_ms=103))['startup_trace']
+        self.assertFalse(startup['evidence']['matching_position_preload'])
+        records = self.startup_raw_records()
+        records[3][0] = 99
+        startup = decode_capture(self.startup_with_records(records))['startup_trace']
+        self.assertFalse(startup['record_ticks_monotonic'])
+        self.assertFalse(startup['evidence']['precise_read_response'])
+        self.assertFalse(startup['startup_sequence_complete'])
+        # A queued old disabled feedback is preserved but is not enable proof.
+        records = self.startup_raw_records()
+        records[6][0] = 102
+        startup = decode_capture(self.startup_with_records(records))['startup_trace']
+        self.assertFalse(startup['record_ticks_monotonic'])
+        self.assertTrue(startup['startup_sequence_complete'])  # newer RXs still prove it
+        for record in records[7:]:
+            record[0] = 102
+        startup = decode_capture(self.startup_with_records(records))['startup_trace']
+        self.assertFalse(startup['evidence']['enabled_feedback'])
+        records = self.startup_raw_records()
+        for record in records:
+            record[0] = (record[0] - 102) & 0xffffffff
+        startup = decode_capture(self.startup_with_records(
+            records, start_ms=0xfffffffe, enable_ms=2))['startup_trace']
+        self.assertTrue(startup['startup_sequence_complete'])
+
+    def test_startup_corrupt_headers_bounds_live_capture_and_boot_are_rejected(self):
+        for index, value in ((7, 2), (8, 2), (9, 2), (10, 6), (11, 257),
+                             (13, 2), (14, 99), (16, 9), (17, 9), (18, 2),
+                             (19, 512), (20, 5), (21, 1), (25, 1)):
+            item = copy.deepcopy(self.startup[0])
+            item['data'][index] = value
+            with self.subTest(index=index), self.assertRaises(ValueError):
+                decode_message(item)
+        item = copy.deepcopy(self.startup[0])
+        item['data'][9] = item['data'][10] = 0
+        with self.assertRaisesRegex(ValueError, 'not frozen'):
+            decode_capture([item])
+        item = copy.deepcopy(self.startup[0])
+        item['data'][3] ^= 1
+        with self.assertRaisesRegex(ValueError, 'mixed boot'):
+            decode_capture([item, self.startup[1]])
+        # J7T1 remains closed to the new marker kind.
+        item = copy.deepcopy(self.trace)
+        item['data'][25] = (7 << 15) | (7 << 18)
+        with self.assertRaisesRegex(ValueError, 'startup marker'):
+            decode_message(item)
 
     def split_pages(self):
         first, second = copy.deepcopy(self.trace), copy.deepcopy(self.trace)

@@ -380,8 +380,9 @@ New endpoints (fixed-size arrays use the existing joint order):
 
 The versioned message/service definitions live in `interfaces/`. Before building
 `libmicroros.a`, run `python3 scripts/prepare_microros_interfaces.py`; this overlays
-the definitions into the initialized micro-ROS submodule. Regenerate the static
-library with the existing Docker command after an interface change. Do not reuse
+the definitions into the initialized micro-ROS submodule and ensures a publisher
+pool of at least 11 without reducing larger local pools. Regenerate the static
+library with the existing Docker command after an interface or pool change. Do not reuse
 an older generated library. CI keys its cache on these versioned inputs.
 
 ### Admission and configuration
@@ -426,10 +427,16 @@ never recreates an expired lease.
    mask, desired control mode (MIT 1 or POS_VEL 2), and the exact latest accepted
    DISABLE sequence. It returns admission only. A stopped new source can take
    over an abandoned owner by CONFIGURE once no lease or switch is active.
-3. The 4 ms control task enqueues at most one register request per step. For each
-   selected axis, it writes register 10, waits for the matching write reply,
+3. The 4 ms control task enqueues at most one register request per step. POS_VEL
+   configuration additionally requires fresh DISABLED feedback and selected-axis
+   absolute speed at most 0.02 rad/s throughout the transaction. For each selected
+   axis it first reads precise position RID `0x50`, requiring a finite value
+   inside that axis's qualified range. This is the rotor-derived output position
+   in radians, not the separate output-encoder RID `0x51`. It then writes
+   register 10, waits for the matching write reply,
    settles for 20 ms, reads back, and checks the actual value. Matching requires
-   feedback CAN ID, motor ID, register and transaction phase. Write/read waits
+   feedback CAN ID, motor ID, register, transaction phase and ISR receive time
+   at or after the request, with a reply age no greater than 100 ms. Write/read waits
    time out after 100 ms. No runtime register operation sleeps or waits in the
    control task. A write immediately marks that axis's actual mode unknown and
    unverified; only matching readback restores verification.
@@ -467,9 +474,21 @@ are no MIT gains or effort fields. RETURN is rejected in V2.
 Only selected axes are enabled, through their verified control mode CAN ID.
 Unselected axes remain disabled. POS_VEL targets are emitted with the existing
 8-byte float encoder at CAN ID `motor_id + 0x100`; receipt never changes a drive's
-mode. Before enabling, the admitted POS target is loaded to replace any old drive target.
-HOLD latches the fresh measured position once and keeps the positive
-requested speed limit. The periodic transport remains necessary: at >100 ms
+mode. After the first admitted V2 frame for a lease, firmware independently
+reads RID `0x50` again while every drive is physically DISABLED and the selected
+axes remain stationary (absolute speed at most 0.02 rad/s). The read is bound to
+the current lease/epoch, must be finite and within the qualified range, and
+must remain no older than 100 ms when enabling. A timeout, invalid reply,
+cancellation or changed lease stops the transaction without a delayed enable.
+The precise measured position is preloaded before a single FC enable frame;
+the FC is not retried automatically. Both frames require two free CAN TX FIFO
+slots; otherwise the task defers them together to a later cycle without waiting,
+while the same seed-age, lease and STOP gates remain active. The explicit TRACK target is sent only
+after all selected axes report enabled. Initial HOLD retains the precise seed
+across repeated HOLD commands. Later HOLD transitions latch fresh feedback as
+before. The requested positive speed limit is retained. These changes avoid an
+initial target jump from quantized feedback; they do not qualify drive dynamics.
+The periodic transport remains necessary: at >100 ms
 without an accepted command, TRACK becomes HOLD and its lease is revoked; at
 >500 ms fault 11 latches. As in V1, enabled drives remain in HOLD under fault 11
 until explicit DISABLE; already disabled drives stay disabled. Feedback timeout,
@@ -502,10 +521,10 @@ MIT integer encoding ranges are not used as POS_VEL capability claims. This
 release implements the complete switching, admission and CAN path, exercised by
 host simulation with a qualified mask; it does not claim hardware qualification.
 
-The micro-ROS pools remain 10 publishers / 5 subscriptions / 1 service / 1 client;
+The micro-ROS pools require at least 11 publishers / 5 subscriptions / 1 service / 1 client;
 the production application uses 6 / 4 / 1 / 0, with six executor handles. The
-opt-in joint7 bench build adds two publishers (8 / 4 / 1 / 0); it adds no
-subscriptions or service/executor handles. Static messages avoid
+opt-in joint7 bench build adds five publishers and one profile-request subscription
+(11 / 5 / 1 / 0), with one additional executor handle. Static messages avoid
 per-frame allocations. Debug/Release cross-compilation and host tests do not prove
 250 Hz timing, RTOS stack high-water marks, XRCE delivery or motor behavior on a
 board; those remain bench checks before enabling POS support.
@@ -515,8 +534,8 @@ RTOS heap reservation):
 
 | Build | DTCMRAM / 128 KiB | RAM_D2 / 32 KiB | FLASH / 1 MiB |
 | --- | --- | --- | --- |
-| Debug | 122352 B (93.35%) | 26720 B (81.54%) | 176628 B |
-| Release | 122344 B (93.34%) | 26720 B (81.54%) | 137672 B |
+| Debug | 122680 B (93.60%) | 26720 B (81.54%) | 179308 B |
+| Release | 122672 B (93.59%) | 26720 B (81.54%) | 139152 B |
 
 DTCMRAM headroom is limited; a successful link does not establish runtime stack
 or heap headroom. Measure task stack high-water marks and allocator free/minimum
@@ -606,8 +625,8 @@ an explicit restart/reflash. This is a feedback-triggered stop; it cannot impose
 a drive-internal current/torque ceiling or guarantee zero transient overshoot.
 
 With the bench diagnostics, profile transaction, guard and queued STOP
-bookkeeping, local linked DTCMRAM use is 123936 bytes (Debug) / 123928 bytes
-(Release), about 94.56% of 128 KiB. This remains a static
+bookkeeping, local linked DTCMRAM use is 124328 bytes (Debug) / 124320 bytes
+(Release), about 94.85% of 128 KiB. This remains a static
 link measurement; task stack high-water marks and allocator headroom still need
 hardware measurement under the intended traffic.
 
@@ -634,7 +653,7 @@ window is a transient bench envelope, not a replacement for that calibration.
 
 Suggested evidence sequence: fresh DISABLE; apply the bounded volatile profile
 and verify its independent readbacks; CONFIGURE joint7 and verify mode readback;
-ACQUIRE; stream current-position TRACK at 20 Hz; a small reviewed opening step;
+ACQUIRE; stream initial precise-position HOLD at 20 Hz; a small reviewed opening step;
 HOLD; explicit DISABLE and physical disabled proof; restore MIT and RELEASE;
 restore the original acceleration and independently verify ACC and DEC.
 Monitor actual position, velocity, effort, feedback age, other-axis enabled bits
@@ -750,7 +769,7 @@ nor a sampled speed guard guarantees continuous physical speed or arrival.
 
 ### Bench diagnostics over ROS
 
-The explicitly enabled joint7 bench image also publishes three `std_msgs/msg/UInt32MultiArray`
+The explicitly enabled joint7 bench image also publishes four `std_msgs/msg/UInt32MultiArray`
 Topics with BEST_EFFORT / VOLATILE QoS. They are absent from production builds:
 
 - `/stm32/joint7_bench_snapshot`: at most 1 Hz; original J7B3 admission/trip
@@ -764,9 +783,13 @@ Topics with BEST_EFFORT / VOLATILE QoS. They are absent from production builds:
 - `/stm32/joint7_bench_calibration`: at most 1 Hz; a separate startup-only
   observation of drive timeout, inertia and electrical identification values.
   It does not change the original snapshot/trace or profile message layouts.
+- `/stm32/joint7_bench_startup_trace`: independent first-enable prefix (J7E1),
+  up to eight records per page, exported repeatedly after freezing. The two
+  trace Topics share a total limit of 20 pages/s; when both are frozen each
+  receives 10 pages/s. A subscriber must collect both independently.
 
 Publishing occurs only in the micro-ROS task, after fresh verified all-axis
-DISABLE, with no enabled axis, no switching and no lease. All three Topics are
+DISABLE, with no enabled axis, no switching and no lease. All four Topics are
 suppressed during motion and the stop-proof interval. The real-time paths only
 copy bounded records; they never allocate, serialize, wait for ROS, or publish.
 Message backing arrays are static. A page copy holds the existing critical
@@ -830,9 +853,9 @@ automatic restore, tuning or qualification decision.
 
 The 512-record ring occupies 8192 explicitly initialized NOLOAD bytes in RAM_D1,
 not DTCMRAM or the RTOS heap. Local production Debug/Release still link at
-122352/122344 DTCMRAM bytes with no trace allocation. The diagnostic bench
-Debug/Release images, including the profile transaction and calibration readout,
-use 123936/123928 DTCMRAM bytes (94.56%/94.55%), 8192 RAM_D1
+122680/122672 DTCMRAM bytes with no trace allocation. The diagnostic bench
+Debug/Release images, including the profile transaction, calibration readout and independent first-enable prefix,
+use 124328/124320 DTCMRAM bytes (94.85%), 12288 RAM_D1
 bytes, and 26720 RAM_D2 bytes. These link sizes include static reservations;
 read the runtime counters as well before drawing conclusions about headroom.
 Records contain MCU milliseconds, a tag and the
@@ -854,6 +877,27 @@ of tail capture, whichever occurs first, then freezes. Repeated DISABLE, ROS
 reconnect and later commands do not clear or reopen this first capture. This is
 one capture per boot; retain it before any independently justified restart.
 Overwritten records and stale/future page cursors are explicitly reported.
+
+The independent 256-record first-enable buffer adds 4096 NOLOAD bytes in RAM_D1.
+It arms immediately before the first lease's pre-enable `0x50` request, inserting
+a START marker (kind 7), so idle/configuration traffic cannot consume its space.
+It never overwrites records and cannot rearm until boot. It freezes 100 ms after
+FC is successfully enqueued, or earlier on capacity, STOP or TRIP; without FC
+it freezes after 500 ms. Freeze reasons are 0 none, 1 enable window ended,
+2 capacity, 3 no-enable timeout, 4 STOP, 5 TRIP. Freezing alone does not prove
+that a complete or successful enable sequence was recorded. Check START,
+matched `0x50` request/reply, identical precise target preload, FC and the first
+enabled feedback in order, plus page completeness. The original rolling buffer
+continues to retain the stop tail independently.
+
+J7E1 (`0x4a374531`) uses the same common words 0–6 and unchanged record tags.
+Words 7–15 are metadata version, armed, frozen, freeze reason, total count,
+start MCU ms, FC enqueued, FC MCU ms, and first command sequence.
+Words 16–21 are page start, page count (0–8), gap flag, capacity=256,
+record words=4, and reserved=0. Records begin at word 22; total length is
+`22 + 4 * page_count`. Unarmed/unfrozen prefixes are not published. The START
+marker contains command sequence in data0 and zero in data1. J7S1, J7T1,
+J7C1, J7B3 and J7P1 layouts are unchanged.
 
 `UInt32MultiArray.layout` is empty. `data` contains numeric uint32 words; all
 float32 and signed-error values are carried as their raw bits. The v1 layouts are:

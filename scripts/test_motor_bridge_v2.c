@@ -5,7 +5,7 @@
 FDCAN_HandleTypeDef hfdcan1;
 HostRng host_rng={0,1,42,0};
 static uint32_t clock_ms;
-static BspFdcanFrame sent[128], received[64];
+static BspFdcanFrame sent[256], received[128];
 static unsigned tx_count, rx_count, rx_pos;
 static bool tx_empty = true;
 static bool tick_advancing, fail_send;
@@ -14,7 +14,7 @@ uint32_t fdcan1_tx_free(void) { return 8U; }
 uint32_t HAL_GetTick(void) { return tick_advancing ? clock_ms++ : clock_ms; }
 uint8_t fdcanx_send_data(FDCAN_HandleTypeDef *h, uint16_t id, uint8_t *data, uint32_t len)
 {
-    (void)h; assert(tx_count<128 && len==8); sent[tx_count].id=id;
+    (void)h; assert(tx_count<256 && len==8); sent[tx_count].id=id;
     memcpy(sent[tx_count++].data,data,8); return fail_send ? 1 : 0;
 }
 uint8_t fdcan1_get_rx_data_at(uint16_t *id, uint8_t *data, uint32_t *received_ms)
@@ -31,12 +31,25 @@ static void feedback(unsigned i, bool enabled)
     f->id=feedback_ids[i]; f->data[0]=(uint8_t)((enabled?0x10:0)|motor_ids[i]);
     f->data[1]=0x80; f->data[3]=0x80; f->data[4]=0x08;
 }
+static void reg_reply(unsigned axis, uint8_t rid, bool write, uint32_t value, uint32_t at)
+{
+    BspFdcanFrame *f=&received[rx_count++];memset(f,0,sizeof(*f));
+    f->id=feedback_ids[axis];f->received_ms=at;
+    if(write) damiao_encode_register_write_cmd(motor_ids[axis],rid,value,f->data);
+    else { damiao_encode_register_read_cmd(motor_ids[axis],rid,f->data);memcpy(f->data+4,&value,4); }
+}
+static void precise_reply(unsigned axis, float position, uint32_t at)
+{
+    uint32_t value;memcpy(&value,&position,4);
+    reg_reply(axis,MV2_REG_PRECISE_POSITION,false,value,at);
+}
 static void fixture(void)
 {
     memset(&state,0,sizeof(state)); motor_v2_init(&state.control,42);
     state.initialized=true; state.snapshot.mode=3; state.snapshot.feedback_valid=true;
     state.feedback_valid_mask=MV2_ALL; state.control.verified_joint_mask=MV2_ALL;
-    for(unsigned i=0;i<7;++i) { state.control.control_modes[i]=1; state.control.position_min[i]=-2; state.control.position_max[i]=2; state.control.velocity_limit_max[i]=1; state.snapshot.last_feedback_ms[i]=100; }
+    for(unsigned i=0;i<7;++i) { state.control.control_modes[i]=1; state.control.position_min[i]=-2; state.control.position_max[i]=2; state.control.velocity_limit_max[i]=1; state.snapshot.last_feedback_ms[i]=100; state.received_feedback_ms[i]=100; }
+    state.disable_ms=99;
     state.control.pos_vel_supported_mask=1; clock_ms=100;tx_count=rx_count=rx_pos=0;
     tick_advancing=fail_send=false;
 #if MOTOR_BENCH_JOINT7_POSVEL
@@ -44,6 +57,7 @@ static void fixture(void)
     memset((void *)&motor_bench_loop_diagnostics,0,sizeof(motor_bench_loop_diagnostics));
     motor_bench_init_calibration((MotorBenchCalibrationDiagnostics *)&motor_bench_calibration_diagnostics);
     motor_bench_trace_init(&motor_bench_trace_meta,motor_bench_trace_records);
+    motor_bench_startup_init(&motor_bench_startup_meta,motor_bench_startup_records);
     motor_bench_profile_init(&motor_bench_profile,42);
     /* These existing adapter scenarios start with already-proven test profile. */
     motor_bench_profile.status.result=MBP_APPLIED;
@@ -54,8 +68,119 @@ static MotorBridgeCommand disable(uint32_t sequence)
 {
     MotorBridgeCommand c={0}; c.sequence=sequence;c.mode=3;return c;
 }
+static MotorCommandV2 begin_seed(bool hold)
+{
+    fixture();
+    state.control.control_modes[0]=2;state.control.owner_source_id=5;
+    state.control.selected_joint_mask=1;state.control.lease_id=1;
+    state.control.last_frame_ms=100;state.snapshot.position[0]=0.125f;
+    MotorCommandV2 c={.boot_id=42,.control_epoch=1,.source_id=5,.lease_id=1,
+        .sequence=1,.mode=hold?0:1,.control_mode=2,.active_joint_mask=1};
+    c.position[0]=hold?0:0.4f;c.velocity_limit[0]=0.02f;
+    assert(motor_bridge_accept_command_v2(&c,100));
+    motor_bridge_control_step(101);assert(state.seed_waiting && !state.seed_complete);
+    return c;
+}
+static void no_enable(void)
+{
+    for(unsigned i=0;i<tx_count;++i) assert(sent[i].data[7]!=0xfc);
+}
+static void refresh_feedback_times(uint32_t now)
+{
+    for(unsigned i=0;i<7;++i) {
+        state.received_feedback_ms[i]=now;state.snapshot.last_feedback_ms[i]=now;
+    }
+}
+static void test_precise_seed_failures(void)
+{
+    for(unsigned variant=0;variant<13;++variant) {
+        (void)begin_seed(true);no_enable();
+        float position=variant==6?NAN:variant==7?3.0f:0.123456f;
+        precise_reply(0,position,variant==5?100:102);
+        BspFdcanFrame *f=&received[rx_count-1];
+        if(variant==0) f->data[3]=0x51; /* Different position register. */
+        if(variant==1) { f->id=feedback_ids[1];f->data[0]=2; }
+        if(variant==2) f->data[0]=2;
+        if(variant==3) f->id=0x77;
+        if(variant==4) f->data[2]=DAMIAO_REG_WRITE_MARKER;
+        if(variant==8) --rx_count; /* Lost reply, no blocking wait/retry. */
+        if(variant==9) {
+            MotorBridgeCommand stop=disable(2);
+            assert(motor_bridge_accept_command(&stop,102));
+        }
+        if(variant==10) motor_v2_watchdog(&state.control,201);
+        if(variant==11) state.snapshot.velocity[0]=0.021f;
+        if(variant==12) fail_send=true;
+        motor_bridge_control_step(variant==10?201:102);
+        /* Send failure happens at precise prefill, before FC. */
+        fail_send=false;no_enable();
+        if(variant<6 || variant==8) {
+            assert(state.seed_waiting);
+            refresh_feedback_times(202);
+            motor_bridge_control_step(202);
+        }
+        assert(state.snapshot.mode==MOTOR_MODE_DISABLE && !state.control.lease_id);
+        no_enable();
+        precise_reply(0,0.123456f,203);motor_bridge_control_step(203);no_enable();
+    }
+    (void)begin_seed(true);fail_send=true;
+    /* A failed initial 0x50 enqueue is terminal, never retried. */
+    state.seed_waiting=false;motor_bridge_control_step(102);fail_send=false;
+    assert(state.snapshot.mode==MOTOR_MODE_DISABLE);no_enable();
+}
+static float last_target(void)
+{
+    for(unsigned i=tx_count;i>0;--i) {
+        if(sent[i-1].id==0x101 && sent[i-1].data[7]!=0xfc && sent[i-1].data[7]!=0xfd) {
+            float p;memcpy(&p,sent[i-1].data,4);return p;
+        }
+    }
+    assert(false);return NAN;
+}
+static void test_precise_hold_and_watchdog(void)
+{
+    MotorCommandV2 c=begin_seed(true);
+    precise_reply(0,0.123456f,102);motor_bridge_control_step(102);
+    assert(state.seed_complete && state.hold_latched && state.hold_position[0]==0.123456f);
+    /* Exactly one FC, even while waiting for physical enabled feedback. */
+    tx_count=0;motor_bridge_control_step(122);no_enable();
+    clock_ms=123;feedback(0,true);motor_bridge_control_step(123);
+    assert(state.seed_enabled_seen==1);
+    c.sequence=2;assert(motor_bridge_accept_command_v2(&c,150));
+    tx_count=0;motor_bridge_control_step(151);
+    float p=last_target();assert(p==0.123456f);
+    assert(!state.seed_waiting); /* Repeated HOLD never reacquires a new seed. */
+    refresh_feedback_times(251);motor_bridge_safety_step(251);
+    assert(!state.control.lease_id && state.snapshot.mode==MOTOR_MODE_HOLD);
+    tx_count=0;motor_bridge_control_step(251);no_enable();
+    assert(state.snapshot.mode==MOTOR_MODE_HOLD && state.snapshot.fault_code==0);
+    refresh_feedback_times(651);motor_bridge_safety_step(651);
+    assert(state.snapshot.mode==MOTOR_MODE_HOLD && state.communication_loss_latched);
+    tx_count=0;motor_bridge_control_step(651);no_enable();
+    assert(state.snapshot.mode==MOTOR_MODE_HOLD && state.snapshot.fault_code==11);
+    /* A seed acquired for TRACK must also survive a HOLD arriving before the
+     * first enabled feedback; the explicit TRACK draft stays separate. */
+    c=begin_seed(false);precise_reply(0,0.123456f,102);motor_bridge_control_step(102);
+    c.sequence=2;c.mode=0;c.position[0]=0;
+    assert(motor_bridge_accept_command_v2(&c,103));
+    clock_ms=104;feedback(0,true);tx_count=0;motor_bridge_control_step(104);
+    assert(state.hold_latched && state.hold_position[0]==0.123456f);
+    p=last_target();assert(p==0.123456f);
+    c.sequence=3;c.mode=1;c.position[0]=0.4f;
+    assert(motor_bridge_accept_command_v2(&c,105));
+    tx_count=0;motor_bridge_control_step(106);
+    p=last_target();assert(p==0.4f);
+    /* Lease loss while waiting for FC acknowledgment stops; it cannot revive
+     * the pending enable from a late valid 0x50 response. */
+    (void)begin_seed(false);precise_reply(0,0.123456f,102);motor_bridge_control_step(102);
+    refresh_feedback_times(201);motor_v2_watchdog(&state.control,201);
+    tx_count=0;motor_bridge_control_step(201);no_enable();
+    assert(state.snapshot.mode==MOTOR_MODE_DISABLE);
+}
 int main(void)
 {
+    test_precise_seed_failures();
+    test_precise_hold_and_watchdog();
     fixture(); MotorBridgeCommand stop=disable(42);
     assert(motor_bridge_accept_command(&stop,100)); assert(!disabled_proven(100));
     for(unsigned i=0;i<7;++i) feedback(i,false);
@@ -64,15 +189,21 @@ int main(void)
     clock_ms=103; for(unsigned i=0;i<7;++i) feedback(i,false);
     motor_bridge_control_step(103); assert(disabled_proven(103));
     MotorControlRequest r={.action=1,.operation_id=1,.boot_id=42,.expected_control_epoch=1,.source_id=5,.active_joint_mask=1,.control_mode=2,.disable_sequence=42};
+    state.snapshot.velocity[0]=0.021f;
+    assert(motor_bridge_control_request(&r,106).error_code==MV2_NOT_DISABLED);
+    state.snapshot.velocity[0]=0;
     assert(motor_bridge_control_request(&r,106).accepted);
-    motor_bridge_control_step(107); assert(sent[tx_count-1].data[3]==DAMIAO_REG_CTRL_MODE);
+    motor_bridge_control_step(107); assert(sent[tx_count-1].data[3]==MV2_REG_PRECISE_POSITION);
+    assert(state.control.control_modes[0]==1);
+    precise_reply(0,0.125f,107);motor_bridge_control_step(107);
+    assert(sent[tx_count-1].data[3]==DAMIAO_REG_CTRL_MODE);
     /* Readback must match CAN ID, motor ID, RID and current transaction phase. */
-    BspFdcanFrame *f=&received[rx_count++]; memset(f,0,sizeof(*f));f->id=feedback_ids[0];
+    BspFdcanFrame *f=&received[rx_count++]; memset(f,0,sizeof(*f));f->id=feedback_ids[0];f->received_ms=108;
     damiao_encode_register_write_cmd(2,DAMIAO_REG_CTRL_MODE,2,f->data);
     motor_bridge_control_step(108); assert(state.control.switching && !state.control.control_modes[0]);
-    f=&received[rx_count++];f->id=feedback_ids[0];damiao_encode_register_write_cmd(1,DAMIAO_REG_CTRL_MODE,2,f->data);
+    f=&received[rx_count++];f->id=feedback_ids[0];f->received_ms=109;damiao_encode_register_write_cmd(1,DAMIAO_REG_CTRL_MODE,2,f->data);
     motor_bridge_control_step(109); motor_bridge_control_step(129);
-    f=&received[rx_count++];f->id=feedback_ids[0];damiao_encode_register_read_cmd(1,DAMIAO_REG_CTRL_MODE,f->data);f->data[4]=2;
+    f=&received[rx_count++];f->id=feedback_ids[0];f->received_ms=130;damiao_encode_register_read_cmd(1,DAMIAO_REG_CTRL_MODE,f->data);f->data[4]=2;
     motor_bridge_control_step(130); assert(state.control.operation_state==MV2_SUCCESS);
     r.action=2;r.operation_id=2;r.expected_control_epoch=state.control.control_epoch;
     assert(motor_bridge_control_request(&r,130).accepted);
@@ -86,9 +217,13 @@ int main(void)
     MotorBridgeCommand legacy={.sequence=43,.mode=1};
     assert(!motor_bridge_accept_command(&legacy,130));assert(state.snapshot.fault_code==0);
     tx_count=0; motor_bridge_control_step(131);
+    assert(state.seed_waiting && !state.seed_complete);
+    for(unsigned i=0;i<tx_count;++i) assert(sent[i].data[7]!=0xfc);
+    precise_reply(0,0.123456f,131);tx_count=0;motor_bridge_control_step(131);
     unsigned enables=0;
     for(unsigned i=0;i<tx_count;++i) if(sent[i].data[7]==0xfc) { assert(sent[i].id==0x101);++enables; }
     assert(enables==1);
+    float seed;memcpy(&seed,sent[0].data,4);assert(seed==0.123456f);
     feedback(0,true);tx_count=0;motor_bridge_control_step(132);
     assert(tx_count==1 && sent[0].id==0x101);
     float pos,vel;memcpy(&pos,sent[0].data,4);memcpy(&vel,sent[0].data+4,4);
@@ -121,9 +256,11 @@ int main(void)
     state.snapshot.position[0]=1.5f;
     assert(motor_bridge_accept_command_v2(&c,100));
     tx_count=0; motor_bridge_control_step(101);
+    assert(state.seed_waiting);
+    precise_reply(0,1.500123f,102);motor_bridge_control_step(102);
     bool primed=false;
     for(unsigned i=0;i<tx_count;++i) if(sent[i].id==0x101 && sent[i].data[7]!=0xfc) {
-        memcpy(&pos,sent[i].data,4); assert(pos==1.5f); primed=true;
+        memcpy(&pos,sent[i].data,4); assert(pos==1.500123f); primed=true;
     }
     assert(primed); c.sequence=2;
     assert(!motor_bridge_accept_command_v2(&c,201)); assert(state.control.reject_code==MV2_FAULT);
@@ -268,7 +405,20 @@ int main(void)
     c.position[6]=0.5f;assert(motor_bridge_accept_command_v2(&c,100));
     /* The preflight's pending STOP must complete before the next control step. */
     state.disable_pending=state.disable_tx_wait=false;
+    state.disable_ms=99; /* fixture models newly received post-stop feedback */
     tx_count=0;motor_bridge_control_step(100);
+    precise_reply(6,0.5f,100);motor_bridge_control_step(100);
+    MotorBenchStartupPage startup_page;MotorBenchTraceRecord startup_records[8];
+    assert(motor_bridge_copy_bench_startup_trace(0,startup_records,8,&startup_page)==6);
+    assert(startup_page.meta.armed && !startup_page.meta.frozen && startup_page.meta.enable_enqueued);
+    assert((startup_records[0].tag>>18)==MOTOR_BENCH_STARTUP_START_KIND);
+    assert((startup_records[1].tag>>18)==MOTOR_BENCH_TRACE_ACCEPTED_V2);
+    assert((startup_records[2].tag>>18)==MOTOR_BENCH_TRACE_TX_OK &&
+        (startup_records[2].tag&0x7ff)==0x7ff && (startup_records[2].data0>>24)==0x50);
+    assert((startup_records[3].tag>>18)==MOTOR_BENCH_TRACE_RX &&
+        (startup_records[3].data0>>24)==0x50);
+    assert((startup_records[4].tag&0x7ff)==0x107 && startup_records[4].data0==0x3f000000);
+    assert(startup_records[5].data0==UINT32_MAX && startup_records[5].data1==0xfcffffff);
     const uint8_t expected_posvel[]={0,0,0,0x3f,0x0a,0xd7,0xa3,0x3c};
     f=&received[rx_count++];memset(f,0,sizeof(*f));f->id=0x17;f->received_ms=98;
     const uint8_t raw_feedback[]={0x17,0x85,0x1e,0x80,0x08,0,0,0};
@@ -286,7 +436,7 @@ int main(void)
             }
             if(kind==MOTOR_BENCH_TRACE_TX_OK && (record->tag&0x7ff)==0x107 &&
                 !memcmp(&record->data0,expected_posvel,8)) saw_tx=true;
-            if(kind==MOTOR_BENCH_TRACE_RX) {
+            if(kind==MOTOR_BENCH_TRACE_RX && record->ms==98) {
                 assert(record->ms==98 && !memcmp(&record->data0,raw_feedback,8));saw_rx=true;
             }
             if(kind==MOTOR_BENCH_TRACE_TX_ERROR) saw_tx_error=true;
@@ -298,6 +448,9 @@ int main(void)
     motor_bridge_get_bench_snapshot(&bench_snapshot);
     assert(bench_snapshot.trace.armed && bench_snapshot.trace.triggered && !bench_snapshot.trace.frozen);
     assert(bench_snapshot.trace.trigger_kind==MOTOR_BENCH_TRACE_STOP && bench_snapshot.trace.trigger_ms==105);
+    motor_bridge_copy_bench_startup_trace(0,startup_records,8,&startup_page);
+    assert(startup_page.meta.frozen && startup_page.meta.reason==MOTOR_BENCH_STARTUP_STOP);
+    uint32_t startup_count=startup_page.meta.count;
     clock_ms=106;motor_bridge_control_step(106);
     clock_ms=204;motor_bridge_control_step(204);
     motor_bridge_get_bench_snapshot(&bench_snapshot);assert(!bench_snapshot.trace.frozen);
@@ -307,6 +460,8 @@ int main(void)
     clock_ms=206;stop=disable(10);assert(motor_bridge_accept_command(&stop,206));
     motor_bridge_control_step(206);motor_bridge_get_bench_snapshot(&bench_snapshot);
     assert(bench_snapshot.trace.next_sequence==frozen_next && bench_snapshot.trace.trigger_ms==105);
+    motor_bridge_copy_bench_startup_trace(0,startup_records,8,&startup_page);
+    assert(startup_page.meta.count==startup_count && startup_page.meta.command_sequence==8);
 #endif
     puts("motor bridge V2 CAN tests passed");
 }

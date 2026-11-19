@@ -8,6 +8,7 @@
 
 #if MOTOR_BENCH_JOINT7_POSVEL
 #include "motor_bench_trace.h"
+#include "motor_bench_startup_trace.h"
 #include "motor_bench_profile.h"
 bool motor_bridge_bench_profile_request(const MotorBenchProfileRequest *request, uint32_t now_ms);
 void motor_bridge_get_bench_profile_status(MotorBenchProfileStatus *status);
@@ -22,6 +23,8 @@ typedef struct {
 void motor_bridge_get_bench_snapshot(MotorBenchSnapshot *snapshot);
 uint32_t motor_bridge_copy_bench_trace(uint32_t start_sequence,
     MotorBenchTraceRecord *output, uint32_t capacity, MotorBenchTracePage *page);
+uint32_t motor_bridge_copy_bench_startup_trace(uint32_t start_sequence,
+    MotorBenchTraceRecord *output, uint32_t capacity, MotorBenchStartupPage *page);
 #endif
 
 #define MOTOR_BRIDGE_JOINT_COUNT 7U
