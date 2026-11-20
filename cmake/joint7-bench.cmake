@@ -1,7 +1,8 @@
 option(MOTOR_BENCH_JOINT7_POSVEL "Enable unqualified joint7-only POS_VEL bench image" OFF)
 option(MOTOR_BENCH_OVERSPEED_STOP "Stop bench motion above 0.1 rad/s feedback" ON)
-if(NOT MOTOR_BENCH_JOINT7_POSVEL AND NOT MOTOR_BENCH_OVERSPEED_STOP)
-    message(FATAL_ERROR "Disabling overspeed stop requires the explicit joint7 bench image")
+option(MOTOR_BENCH_EFFORT_STOP "Stop bench motion above 0.30 Nm reported effort" ON)
+if(NOT MOTOR_BENCH_JOINT7_POSVEL AND (NOT MOTOR_BENCH_OVERSPEED_STOP OR NOT MOTOR_BENCH_EFFORT_STOP))
+    message(FATAL_ERROR "Disabling speed/effort stops requires the explicit joint7 bench image")
 endif()
 foreach(parameter POSITION_MIN POSITION_MAX VELOCITY_MAX)
     set(MOTOR_BENCH_${parameter} "" CACHE STRING "Explicit joint7 bench ${parameter} (rad or rad/s)")
@@ -28,7 +29,14 @@ if(MOTOR_BENCH_JOINT7_POSVEL)
         set(bench_overspeed_stop 0)
         message(WARNING "SUPERVISED BENCH: overspeed stop OFF; speed feedback still recorded, other guards remain")
     endif()
+    if(MOTOR_BENCH_EFFORT_STOP)
+        set(bench_effort_stop 1)
+    else()
+        set(bench_effort_stop 0)
+        message(WARNING "SUPERVISED BENCH: effort stop OFF; effort feedback still recorded, drive-native protection unchanged")
+    endif()
     add_compile_definitions(MOTOR_BENCH_JOINT7_POSVEL=1
+        MOTOR_BENCH_EFFORT_STOP=${bench_effort_stop}
         MOTOR_BENCH_OVERSPEED_STOP=${bench_overspeed_stop}
         MOTOR_BENCH_POSITION_MIN=${MOTOR_BENCH_POSITION_MIN}f
         MOTOR_BENCH_POSITION_MAX=${MOTOR_BENCH_POSITION_MAX}f

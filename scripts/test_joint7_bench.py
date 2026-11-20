@@ -57,6 +57,9 @@ class BenchBuildTest(unittest.TestCase):
                 ({}, 'normal', True),
                 ({'MOTOR_BENCH_JOINT7_POSVEL': 'OFF', 'MOTOR_BENCH_OVERSPEED_STOP': 'OFF'}, 'production_optout', False),
                 ({'MOTOR_BENCH_OVERSPEED_STOP': 'OFF'}, 'supervised', True),
+                ({'MOTOR_BENCH_EFFORT_STOP': 'OFF'}, 'effort_supervised', True),
+                ({'MOTOR_BENCH_OVERSPEED_STOP': 'OFF', 'MOTOR_BENCH_EFFORT_STOP': 'OFF'}, 'both_supervised', True),
+                ({'MOTOR_BENCH_JOINT7_POSVEL': 'OFF', 'MOTOR_BENCH_EFFORT_STOP': 'OFF'}, 'effort_production', False),
                 ({'MOTOR_BENCH_JOINT7_POSVEL': 'ON'}, 'missing', False),
                 ({'MOTOR_BENCH_POSITION_MIN': 'nan'}, 'nan', False),
                 ({'MOTOR_BENCH_POSITION_MAX': '0.4'}, 'inverted', False),
@@ -82,14 +85,16 @@ class BenchBuildTest(unittest.TestCase):
 
     def test_feedback_guard_default_and_supervised(self):
         with tempfile.TemporaryDirectory() as temporary:
-            for mode in (None, '0'):
-                output = str(Path(temporary) / ('guard-' + str(mode)))
+            for mode, effort in ((None, None), ('0', None), (None, '0'), ('0', '0')):
+                output = str(Path(temporary) / ('guard-' + str(mode) + '-' + str(effort)))
                 command = ['cc', '-std=c11', '-Wall', '-Wextra', '-Werror',
                     '-I' + str(ROOT / 'User'), '-DMOTOR_BENCH_JOINT7_POSVEL=1',
                     '-DMOTOR_BENCH_POSITION_MIN=0.48f', '-DMOTOR_BENCH_POSITION_MAX=0.51f',
                     '-DMOTOR_BENCH_VELOCITY_MAX=0.05f']
                 if mode is not None:
                     command.append('-DMOTOR_BENCH_OVERSPEED_STOP=' + mode)
+                if effort is not None:
+                    command.append('-DMOTOR_BENCH_EFFORT_STOP=' + effort)
                 command += [str(ROOT / 'scripts/test_motor_bench.c'), '-o', output]
                 subprocess.run(command, check=True, capture_output=True)
                 subprocess.run([output], check=True, capture_output=True)
@@ -126,11 +131,23 @@ class BenchBuildTest(unittest.TestCase):
                 self.assertIn(parameter, text)
             self.assertNotIn('st-flash', text)
             self.assertIn('-DMOTOR_BENCH_OVERSPEED_STOP=ON', text)
+            self.assertIn('-DMOTOR_BENCH_EFFORT_STOP=ON', text)
             log.write_text('')
             self.assertNotEqual(run('--disable-overspeed-stop', '--build-only').returncode, 0)
             self.assertEqual(log.read_text(), '')
             self.assertEqual(run(*bounds, '--disable-overspeed-stop', '--build-only').returncode, 0)
             self.assertIn('-DMOTOR_BENCH_OVERSPEED_STOP=OFF', log.read_text())
+            self.assertIn('-DMOTOR_BENCH_EFFORT_STOP=ON', log.read_text())
+            log.write_text('')
+            self.assertNotEqual(run('--disable-effort-stop', '--build-only').returncode, 0)
+            self.assertEqual(log.read_text(), '')
+            self.assertEqual(run(*bounds, '--disable-overspeed-stop', '--disable-effort-stop', '--build-only').returncode, 0)
+            self.assertIn('-DMOTOR_BENCH_OVERSPEED_STOP=OFF', log.read_text())
+            self.assertIn('-DMOTOR_BENCH_EFFORT_STOP=OFF', log.read_text())
+            log.write_text('')
+            self.assertEqual(run(*bounds, '--build-only').returncode, 0)
+            self.assertIn('-DMOTOR_BENCH_EFFORT_STOP=ON', log.read_text())
+            self.assertIn('-DMOTOR_BENCH_OVERSPEED_STOP=ON', log.read_text())
             log.write_text('')
             self.assertEqual(run(*bounds, '--serial', 'ABC123').returncode, 0)
             self.assertIn('st-flash --serial ABC123 --reset write', log.read_text())

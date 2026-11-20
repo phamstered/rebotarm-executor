@@ -14,6 +14,10 @@
 #define MOTOR_BENCH_OVERSPEED_STOP 1
 #endif
 
+#ifndef MOTOR_BENCH_EFFORT_STOP
+#define MOTOR_BENCH_EFFORT_STOP 1
+#endif
+
 #if MOTOR_BENCH_JOINT7_POSVEL
 #if !defined(MOTOR_BENCH_POSITION_MIN) || !defined(MOTOR_BENCH_POSITION_MAX) || !defined(MOTOR_BENCH_VELOCITY_MAX)
 #error "Bench image requires explicit joint7 position and speed bounds"
@@ -102,7 +106,7 @@ static inline uint32_t motor_bench_feedback_reason(bool valid, uint32_t age_ms,
     if (position < MOTOR_BENCH_POSITION_MIN ||
         position > MOTOR_BENCH_POSITION_MAX) return 3U;
     if (MOTOR_BENCH_OVERSPEED_STOP && fabsf(velocity) > 0.1f) return 4U;
-    if (fabsf(effort) > 0.30f) return 5U;
+    if (MOTOR_BENCH_EFFORT_STOP && fabsf(effort) > 0.30f) return 5U;
     return 0U;
 }
 
