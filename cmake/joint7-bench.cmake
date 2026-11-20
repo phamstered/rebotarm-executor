@@ -15,8 +15,8 @@ if(MOTOR_BENCH_JOINT7_POSVEL)
     endforeach()
     if(NOT MOTOR_BENCH_POSITION_MIN LESS MOTOR_BENCH_POSITION_MAX OR
        MOTOR_BENCH_POSITION_MIN LESS -12.5 OR MOTOR_BENCH_POSITION_MAX GREATER 12.5 OR
-       NOT MOTOR_BENCH_VELOCITY_MAX GREATER 0 OR MOTOR_BENCH_VELOCITY_MAX GREATER 0.05)
-        message(FATAL_ERROR "Invalid bench bounds: min < max inside feedback range, 0 < speed <= 0.05 rad/s required")
+       NOT MOTOR_BENCH_VELOCITY_MAX GREATER 0 OR MOTOR_BENCH_VELOCITY_MAX GREATER 0.1)
+        message(FATAL_ERROR "Invalid bench bounds: min < max inside feedback range, 0 < speed <= 0.1 rad/s required")
     endif()
     # This target is deliberately distinct from the production Debug/Release images.
     if(CMAKE_BINARY_DIR STREQUAL "${CMAKE_SOURCE_DIR}/build/Debug" OR

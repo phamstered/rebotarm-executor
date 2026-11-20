@@ -563,7 +563,7 @@ position/speed admission and watchdog gates remain in force.
 
 Build configuration requires explicit finite decimal `MOTOR_BENCH_POSITION_MIN`,
 `MOTOR_BENCH_POSITION_MAX` and `MOTOR_BENCH_VELOCITY_MAX`, with min < max and
-0 < speed <= 0.05 rad/s. The window must lie inside the feedback encoding range
+0 < speed <= 0.1 rad/s. The window must lie inside the feedback encoding range
 [-12.5, 12.5], which is **not a physical travel limit**. Use a dedicated build
 directory; configuring the bench option in production Debug/Release directories
 is rejected. There are no motion defaults or automatic enables.
@@ -591,7 +591,7 @@ speed-loop damping factor: its existing finite-positive check is retained as
 an additional conservative data check, and never substitutes for reading Deta.
 MAX_SPD describes the motor before the gearbox; it is not compared directly
 with the output-shaft POS_VEL command cap. The explicit command cap still
-remains at or below 0.05 rad/s. These basic parameter checks do not qualify the
+remains at or below 0.1 rad/s. These basic parameter checks do not qualify the
 inner-loop tuning or establish torque limits.
 The additional startup delay can be up to 1.2 seconds. Runtime switching stays
 asynchronous. Normal fresh physical DISABLE proof is still required afterwards.
@@ -644,8 +644,13 @@ flag is explicitly provided. Record both flags with the captured evidence;
 existing snapshot fields do not encode these switches.
 
 The 0.1 rad/s feedback stop threshold is separate from the command speed cap
-(`MOTOR_BENCH_VELOCITY_MAX`, still at most 0.05 rad/s); it does not increase
-the requested speed. The half-opening diagnostic trial uses 0.005 rad/s.
+(`MOTOR_BENCH_VELOCITY_MAX`, at most 0.1 rad/s); configuring the cap does not
+increase the requested speed. Existing 0.05 rad/s configurations remain valid.
+A supervised trial may explicitly configure and command 0.1 rad/s; slower
+0.005 rad/s trials remain supported. The independent feedback stop remains
+0.1 rad/s by default, so feedback overshoot can still stop a command at the
+ceiling unless the separate supervised opt-out is explicitly selected.
+This bench-only ceiling is not production motor qualification.
 
 With the bench diagnostics, profile transaction, guard and queued STOP
 bookkeeping, local linked DTCMRAM use is 124328 bytes (Debug) / 124320 bytes

@@ -64,7 +64,10 @@ class BenchBuildTest(unittest.TestCase):
                 ({'MOTOR_BENCH_POSITION_MIN': 'nan'}, 'nan', False),
                 ({'MOTOR_BENCH_POSITION_MAX': '0.4'}, 'inverted', False),
                 ({'MOTOR_BENCH_VELOCITY_MAX': '0.0'}, 'zero', False),
-                ({'MOTOR_BENCH_VELOCITY_MAX': '0.051'}, 'fast', False),
+                ({'MOTOR_BENCH_VELOCITY_MAX': '0.1'}, 'speed_ceiling', True),
+                ({'MOTOR_BENCH_VELOCITY_MAX': '0.100000001'}, 'fast', False),
+                ({'MOTOR_BENCH_VELOCITY_MAX': '-0.1'}, 'negative_speed', False),
+                ({'MOTOR_BENCH_VELOCITY_MAX': 'inf'}, 'nonfinite_speed', False),
                 ({'MOTOR_BENCH_POSITION_MIN': '-12.6'}, 'range', False),
                 ({}, 'build/Debug', False),
                 ({}, 'bench', True),
@@ -90,7 +93,7 @@ class BenchBuildTest(unittest.TestCase):
                 command = ['cc', '-std=c11', '-Wall', '-Wextra', '-Werror',
                     '-I' + str(ROOT / 'User'), '-DMOTOR_BENCH_JOINT7_POSVEL=1',
                     '-DMOTOR_BENCH_POSITION_MIN=0.48f', '-DMOTOR_BENCH_POSITION_MAX=0.51f',
-                    '-DMOTOR_BENCH_VELOCITY_MAX=0.05f']
+                    '-DMOTOR_BENCH_VELOCITY_MAX=0.1f']
                 if mode is not None:
                     command.append('-DMOTOR_BENCH_OVERSPEED_STOP=' + mode)
                 if effort is not None:

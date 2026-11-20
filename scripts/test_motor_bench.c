@@ -36,6 +36,14 @@ static int read_register(uint8_t rid, uint32_t *value, void *context)
 }
 int main(void)
 {
+    assert(motor_bench_velocity_limit_valid(0.05f));
+    assert(motor_bench_velocity_limit_valid(0.1f));
+    const float invalid_command_speeds[] = {
+        0.0f, -0.0f, -0.1f, NAN, INFINITY, -INFINITY,
+        motor_bench_float(0x3dccccceU) /* One float32 ULP above 0.1f. */
+    };
+    for (unsigned i = 0; i < sizeof(invalid_command_speeds) / sizeof(*invalid_command_speeds); ++i)
+        assert(!motor_bench_velocity_limit_valid(invalid_command_speeds[i]));
     MotorBenchDiagnostics d;
     assert(motor_bench_collect(&d, true, 0.50f, read_register, NULL));
     assert(sizeof(d) == 148 && d.magic == 0x4a374233);
