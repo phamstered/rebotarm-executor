@@ -117,6 +117,11 @@ static inline float motor_bench_float(uint32_t raw)
     return value;
 }
 
+static inline bool motor_bench_velocity_limit_valid(float velocity)
+{
+    return isfinite(velocity) && velocity > 0.0f && velocity <= 0.1f;
+}
+
 static inline bool motor_bench_collect(MotorBenchDiagnostics *d, bool disabled,
     float position, MotorBenchRead read_register, void *context)
 {
@@ -130,7 +135,7 @@ static inline bool motor_bench_collect(MotorBenchDiagnostics *d, bool disabled,
         isfinite(d->position_min) && isfinite(d->position_max) &&
         isfinite(d->velocity_max) && d->position_min < d->position_max &&
         position >= d->position_min && position <= d->position_max &&
-        d->velocity_max > 0.0f && d->velocity_max <= 0.05f;
+        motor_bench_velocity_limit_valid(d->velocity_max);
     /* Never issue diagnostic requests if startup feedback reported an enabled drive. */
     if (!disabled) { d->complete = 1; return false; }
     for (uint32_t i = 0; i < MOTOR_BENCH_REGISTER_COUNT; ++i) {
