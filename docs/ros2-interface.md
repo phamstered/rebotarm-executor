@@ -633,6 +633,16 @@ supervised build does not silently carry the opt-out into the next invocation.
 The option does not change command speed or qualify POS_VEL operation; record
 the build flag in the test receipt. Existing snapshot fields do not expose it.
 
+`MOTOR_BENCH_EFFORT_STOP` independently defaults to `ON`. A supervised bench
+may explicitly set it to `OFF` (`--disable-effort-stop`) to record reported
+effort without triggering reason 5 above 0.30 Nm. It may be combined with the
+speed-stop opt-out. No drive-native current/torque/protection registers are
+modified by either build option. Nonfinite values, position window, feedback
+freshness, lease and DISABLE protections remain. Production configurations
+reject either opt-out. The script restores both options to `ON` unless each
+flag is explicitly provided. Record both flags with the captured evidence;
+existing snapshot fields do not encode these switches.
+
 The 0.1 rad/s feedback stop threshold is separate from the command speed cap
 (`MOTOR_BENCH_VELOCITY_MAX`, still at most 0.05 rad/s); it does not increase
 the requested speed. The half-opening diagnostic trial uses 0.005 rad/s.

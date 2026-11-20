@@ -136,7 +136,13 @@ int main(void)
     assert(!motor_bench_feedback_reason(true, 0, 0.5f, 0.15f, 0));
     assert(!motor_bench_feedback_reason(true, 0, 0.5f, -0.15f, 0));
 #endif
+#if MOTOR_BENCH_EFFORT_STOP
     assert(motor_bench_feedback_reason(true, 0, 0.5f, 0, -0.301f) == 5);
+    assert(motor_bench_feedback_reason(true, 0, 0.5f, 0, 0.301f) == 5);
+#else
+    assert(!motor_bench_feedback_reason(true, 0, 0.5f, 0, -0.5f));
+    assert(!motor_bench_feedback_reason(true, 0, 0.5f, 0, 0.5f));
+#endif
     MotorBenchLoopDiagnostics loop;
     calls = 0;
     motor_bench_collect_loop(&loop, false, read_register, NULL);
