@@ -636,10 +636,10 @@ void motor_bridge_init(void)
 #if MOTOR_BENCH_JOINT7_POSVEL
     motor_bench_profile_init(&motor_bench_profile, state.control.boot_id);
 #endif
-    /* POS capabilities stay zero until each model/firmware is bench-qualified. */
+    /* Availability comes from the explicit deployment profile; runtime gates remain. */
     for (uint32_t i = 0; i < MOTOR_BRIDGE_JOINT_COUNT; ++i) {
-        const MotorQualifiedCapability *cap = &motor_qualified_capabilities[i];
-        if (cap->pos_vel_qualified && isfinite(cap->position_min) &&
+        const MotorConfiguredCapability *cap = &motor_configured_capabilities[i];
+        if (cap->pos_vel_enabled && isfinite(cap->position_min) &&
             isfinite(cap->position_max) && isfinite(cap->velocity_limit_max) &&
             cap->position_min < cap->position_max && cap->velocity_limit_max > 0) {
             state.control.pos_vel_supported_mask |= 1U << i;
@@ -1106,6 +1106,21 @@ static void control_step_locked(uint32_t now_ms)
     }
 
     if (state.using_v2) {
+#if MOTOR_POSVEL_URDF_PROFILE
+        /* Enforce measured travel throughout TRACK as well as target admission.
+         * Disabled/unselected axes do not prevent control of a different axis. */
+        for (uint32_t i = 0; i < MOTOR_BRIDGE_JOINT_COUNT; ++i) {
+            if ((state.command_v2.active_joint_mask & (1U << i)) &&
+                (!isfinite(state.snapshot.position[i]) ||
+                 state.snapshot.position[i] < state.control.position_min[i] ||
+                 state.snapshot.position[i] > state.control.position_max[i])) {
+                state.snapshot.fault_code = MOTOR_FAULT_COMMAND_LIMIT;
+                set_mode(MOTOR_MODE_DISABLE);
+                (void)send_disable();
+                return;
+            }
+        }
+#endif
         for (uint32_t i = 0; i < MOTOR_BRIDGE_JOINT_COUNT; ++i) {
             if (!(state.command_v2.active_joint_mask & (1U << i)) && state.motor_enabled[i]) {
                 set_mode(MOTOR_MODE_DISABLE); (void)send_disable(); return;
