@@ -10,6 +10,7 @@ BUILD_DIR="$PROJECT_DIR/build/Debug"
 USE_OPENOCD=false
 BUILD_ONLY=false
 BENCH=false
+URDF_PROFILE=false
 OVERSPEED_STOP=ON
 EFFORT_STOP=ON
 SERIAL=""
@@ -23,6 +24,7 @@ while (($#)); do
         --build) : ;; # Historical alias: every invocation already rebuilds.
         --build-only) BUILD_ONLY=true ;;
         --bench-joint7) BENCH=true ;;
+        --posvel-seven) URDF_PROFILE=true ;;
         --disable-overspeed-stop) OVERSPEED_STOP=OFF ;;
         --disable-effort-stop) EFFORT_STOP=OFF ;;
         --serial|--position-min|--position-max|--velocity-max)
@@ -36,6 +38,7 @@ while (($#)); do
             shift ;;
         --help|-h)
             echo "Usage: $0 [--openocd] [--serial SERIAL] [--build-only]"
+            echo "Seven-axis: --posvel-seven --serial SERIAL (URDF bounds, 0.1 rad/s; no automatic enable)"
             echo "Bench: --bench-joint7 --position-min RAD --position-max RAD --velocity-max RAD_S"
             echo "Supervised bench only: --disable-overspeed-stop (speed logging remains; other guards remain)"
             echo "Supervised bench only: --disable-effort-stop (reported effort logging remains)"
@@ -50,7 +53,10 @@ done
 if [[ "$OVERSPEED_STOP" == OFF || "$EFFORT_STOP" == OFF ]] && ! "$BENCH"; then
     echo "Speed/effort stop opt-outs require --bench-joint7" >&2; exit 2
 fi
-CONFIGURE_ARGS=(--preset Debug -DMOTOR_BENCH_JOINT7_POSVEL=OFF -DMOTOR_BENCH_OVERSPEED_STOP=ON -DMOTOR_BENCH_EFFORT_STOP=ON)
+if "$URDF_PROFILE" && "$BENCH"; then
+    echo "--posvel-seven conflicts with --bench-joint7" >&2; exit 2
+fi
+CONFIGURE_ARGS=(--preset Debug -DMOTOR_POSVEL_URDF_PROFILE=OFF -DMOTOR_BENCH_JOINT7_POSVEL=OFF -DMOTOR_BENCH_OVERSPEED_STOP=ON -DMOTOR_BENCH_EFFORT_STOP=ON)
 if "$BENCH"; then
     if [[ -z "$POSITION_MIN" || -z "$POSITION_MAX" || -z "$VELOCITY_MAX" ]]; then
         echo "Bench requires explicit --position-min, --position-max and --velocity-max" >&2; exit 2
@@ -69,6 +75,13 @@ elif [[ -n "$POSITION_MIN$POSITION_MAX$VELOCITY_MAX" ]]; then
 fi
 if [[ -n "$SERIAL" && ! "$SERIAL" =~ ^[a-zA-Z0-9]+$ ]]; then
     echo "Invalid probe serial" >&2; exit 2
+fi
+if "$URDF_PROFILE"; then
+    if ! "$BUILD_ONLY" && [[ -z "$SERIAL" ]]; then
+        echo "Seven-axis flashing requires an explicitly verified --serial" >&2; exit 2
+    fi
+    BUILD_DIR="$PROJECT_DIR/build/PosVelSevenDebug"
+    CONFIGURE_ARGS+=(-B "$BUILD_DIR" -DMOTOR_POSVEL_URDF_PROFILE=ON)
 fi
 BIN_FILE="$BUILD_DIR/rebotarm_executor.bin"
 ELF_FILE="$BUILD_DIR/rebotarm_executor.elf"

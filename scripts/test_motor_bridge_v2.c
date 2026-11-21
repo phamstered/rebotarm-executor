@@ -179,6 +179,20 @@ static void test_precise_hold_and_watchdog(void)
 }
 int main(void)
 {
+#if MOTOR_POSVEL_URDF_PROFILE
+    for (unsigned axis=0;axis<7;axis++) {
+        fixture(); state.using_v2=true; state.have_command=true;
+        state.snapshot.mode=MOTOR_MODE_TRACK;
+        state.command_v2.active_joint_mask=1U<<axis;
+        state.snapshot.position[axis]=3; /* fixture limits [-2,2] */
+        motor_bridge_control_step(100);
+        assert(state.snapshot.mode==MOTOR_MODE_DISABLE);
+        assert(state.snapshot.fault_code==MOTOR_FAULT_COMMAND_LIMIT);
+        for(unsigned i=0;i<tx_count;i++)
+            assert(sent[i].id < 0x101 || sent[i].id > 0x107); /* only feedback requests / MIT DISABLE */
+    }
+#endif
+
     test_precise_seed_failures();
     test_precise_hold_and_watchdog();
     fixture(); MotorBridgeCommand stop=disable(42);

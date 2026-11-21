@@ -552,6 +552,66 @@ cmake --preset Debug && cmake --build build/Debug
 cmake --preset Release && cmake --build build/Release
 ```
 
+### Explicit seven-axis URDF POS_VEL deployment profile
+
+`MOTOR_POSVEL_URDF_PROFILE=ON` enables all seven capability bits (`0x7f`) in a
+separate build directory. Default Debug/Release builds remain closed (`0`).
+This is explicit operator configuration, **not completed model/firmware bench
+qualification**. It is mutually exclusive with `MOTOR_BENCH_JOINT7_POSVEL` and
+does not apply the temporary ACC profile or change drive parameters at startup.
+MIT remains the startup mode; no lease, mode switch or enable is automatic.
+
+The profile uses `rebotarm-ros2-stack` revision
+`8e9b2381e415cf79b11d43e44b9788c3dc80c6c9`,
+`src/rebotarm_gazebo/urdf/rebotarm.urdf` and
+`src/plugin/microros_stm32h723_bridge/urdf/rebotarm.arm.micro_ros.xacro`.
+Firmware does not load a live URDF: changes to limits, zero or calibration require
+reviewing and rebuilding this configuration.
+
+| Axis | Model family | Raw motor position (rad) | Command speed cap (rad/s) |
+| --- | --- | --- | --- |
+| joint1 | DM4340P | -2.8 .. 2.8 | 0.1 |
+| joint2 | DM4340P | -3.14 .. 0 | 0.1 |
+| joint3 | DM4340P | -3.14 .. 0 | 0.1 |
+| joint4 | DM4310 | -1.87 .. 1.57 | 0.1 |
+| joint5 | DM4310 | -1.57 .. 1.57 | 0.1 |
+| joint6 | DM4310 | -3.14 .. 3.14 | 0.1 |
+| joint7 / left finger | DM4310 | -7.8043180 .. 0.4972534 | 0.1 |
+
+Joint7 URDF is prismatic, **0 .. 0.0715 metres**, not radians.
+`finger_m = raw_rad * -0.008612826752 + 0.004282757541`; firmware endpoints are
+rounded inward at float precision. The upper endpoint must not be enlarged to
+admit an out-of-range current reading. For example `0.511749 rad` is rejected;
+check the physical zero/calibration before mode switching. No automatic motion
+or re-zero is performed to get into range. URDF limits alone do not prove the
+installed mechanism is safe across the full stroke.
+
+Existing identity, ownership, lease, explicit DISABLE, fresh feedback, mode
+readback, target bounds, positive finite speed, fault and watchdog gates remain.
+Additionally, this profile checks selected axes' measured position on every
+active V2 control step, latching COMMAND_LIMIT and requesting all-axis DISABLE
+on a nonfinite or out-of-range position. No overshoot allowance is added.
+Unselected/disabled axes are not commanded to move into their limits. Position
+bounds and command speed caps are not independent force or torque protection.
+Previously observed joint7 overshoot remains a hardware validation limitation;
+full-stroke and six-arm-axis behavior have not been qualified by host tests.
+
+```bash
+./scripts/flash.sh --posvel-seven --build-only
+# After checking MCU/probe identity and supported, output-off hardware:
+./scripts/flash.sh --posvel-seven --serial VERIFIED_STLINK_SERIAL
+cmake --preset Release -B build/PosVelSevenRelease -DMOTOR_POSVEL_URDF_PROFILE=ON
+cmake --build build/PosVelSevenRelease
+python3 scripts/test_posvel_profile.py
+```
+
+The flash helper requires an explicit probe serial and uses
+`build/PosVelSevenDebug`, never the default/bench build directories. Flashing
+resets the MCU at `0x08000000`. Read back a new boot ID, mask, per-axis limits,
+MIT modes and all-axis disabled feedback before using the application.
+The application must honor capability/feedback gates; do not bypass them to
+make the POS_VEL button clickable.
+
 ### Joint7 bench image
 
 `MOTOR_BENCH_JOINT7_POSVEL` defaults OFF. Production builds still report no

@@ -110,3 +110,11 @@ npm run docs:dev
 - 接口（topic / 字段 / 模式 / 故障码等）变更须与 [`docs/ros2-interface.md`](docs/ros2-interface.md) **同补丁**更新。
 
 细节以接口文档与仓库内实现为准；本 README 不替代 `docs/` 与 `PLAN.md`。
+
+### Explicit seven-axis POS_VEL configuration
+
+Use `./scripts/flash.sh --posvel-seven --build-only` to prepare the opt-in
+seven-axis URDF profile (0.1 rad/s command caps). It does not automatically
+switch modes or enable outputs. Default builds remain closed. See
+[the interface contract](docs/ros2-interface.md#explicit-seven-axis-urdf-pos_vel-deployment-profile)
+for exact units, gripper calibration, limits and physical validation boundaries.
